@@ -1,0 +1,32 @@
+# ROS 2 build artifacts
+ros2/build/
+ros2/install/
+ros2/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / recordings
+data/
+list/
+
+# Nested repos (already tracked independently)
+ros2/src/rq_fts_ros2_driver/
