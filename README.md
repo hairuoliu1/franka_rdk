@@ -169,7 +169,7 @@ export UV_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
 
 ---
 
-## 启动流程
+## 遥操作
 
 ### 步骤 1：查找串口 ID
 
@@ -237,14 +237,30 @@ ros2 launch realsense2_camera rs_launch.py \
 ros2 topic list | grep -E "cam1|cam2|color/image"
 ```
 
-### 步骤 5：启动 Franka 机械臂
+### 步骤 5：启动 GELLO 状态发布器
+
+> **必须先启动 GELLO，再启动 Franka 控制器。** 否则 joint_impedance_controller 收不到有效的关节状态，机械臂会因目标位置跳变触发 reflex 保护 (power_limit_violation / joint_velocity_violation)。
 
 ```bash
-# 真机模式
-ros2 launch franka_bringup franka.launch.py use_fake_hardware:=false
+ros2 launch franka_gello_state_publisher main.launch.py \
+    config_file:=/workspace/src/config/gello_publisher.yaml
+```
 
-# 仿真测试模式
-ros2 launch franka_bringup franka.launch.py use_fake_hardware:=true fake_sensor_commands:=true
+验证 GELLO 正常发布：
+
+```bash
+ros2 topic echo /left/gello/joint_states
+ros2 topic echo /right/gello/joint_states
+# 确认关节值在正常范围内 (不应出现 ±2.9007 等极限值)
+```
+
+### 步骤 6：启动 Franka 机械臂
+
+> 确认 GELLO 正常发布后，再启动此步骤。
+
+```bash
+ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
+    robot_config_file:=/workspace/src/config/fr3_config.yaml
 ```
 
 启动后的话题列表：
@@ -277,23 +293,7 @@ ros2 launch franka_bringup example.launch.py \
   robot_config_file:=./franka.config.yaml
 ```
 
-### 步骤 6：启动 FR3 关节阻抗控制器
-
-```bash
-ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
-    config_file:=/workspace/src/config/fr3_config.yaml
-```
-
-### 步骤 7：启动 GELLO 状态发布器
-
-```bash
-ros2 launch franka_gello_state_publisher main.launch.py \
-    config_file:=/workspace/src/config/gello_publisher.yaml
-```
-
-> 步骤 6 和 7 的顺序可以互换，但两者都启动后遥操作才能正常工作。
-
-### 步骤 8：启动 Robotiq 夹爪管理器
+### 步骤 7：启动 Robotiq 夹爪管理器
 
 ```bash
 # 确认串口存在
@@ -531,7 +531,7 @@ ros2 launch franka_gello_state_publisher main.launch.py \
 
 # ===== 终端 2: 关节阻抗控制器 =====
 ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
-    config_file:=/workspace/src/config/fr3_config.yaml
+    robot_config_file:=/workspace/src/config/fr3_config.yaml
 
 # ===== 终端 3: Robotiq 夹爪 =====
 ros2 launch franka_gripper_manager robotiq_gripper_controller_client.launch.py \
@@ -608,6 +608,18 @@ SerialException: could not open port
 - 检查设备是否正确连接，`ls /dev/serial/by-id/` 确认设备存在
 - Docker 中运行时确保启动容器前设备已插入，且 docker-compose 已挂载 `/dev`
 - 检查设备权限：`sudo chmod 666 /dev/serial/by-id/<设备名>`
+
+### 机械臂 reflex 保护触发 (power_limit_violation / joint_velocity_violation)
+
+```
+[FrankaHardwareInterface]: libfranka: Move command aborted: motion aborted by reflex! ["power_limit_violation"]
+[FrankaHardwareInterface]: libfranka: Move command aborted: motion aborted by reflex! ["joint_velocity_violation"]
+```
+
+- **确认 GELLO 已先于 Franka 控制器启动**，且正常发布关节状态
+- 检查 GELLO 关节值是否正常：`ros2 topic echo /left/gello/joint_states`，不应出现 ±2.9007 等关节极限值
+- 如果值异常，需重新校准 GELLO（步骤 2）或将 GELLO 物理摆到机械臂当前位姿附近
+- GELLO 正常后，重启 Franka 控制器
 
 ### 机械臂运动不平滑
 

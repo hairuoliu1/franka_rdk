@@ -1,7 +1,7 @@
-# robot1:
-#   com_port: "/dev/serial/by-id/usb-FTDI_USB_TO_RS-485_DAAQMJL8-if00-port0"
-#   namespace: "gripper"
-
 LEFT:
   com_port: "/dev/serial/by-id/usb-FTDI_USB_TO_RS-485_DAAQMJL8-if00-port0"
   namespace: "left/gripper"
+
+RIGHT:
+  com_port: "/dev/serial/by-id/usb-FTDI_USB_TO_RS-485_DAK2KP71-if00-port0"
+  namespace: "right/gripper"
