@@ -55,19 +55,27 @@ controller_interface::return_type JointImpedanceController::update(
   Vector7d q_goal;
   Vector7d tau_d_calculated;
 
+  // 默认位置保持，直到接收到有效的关节状态并初始化运动生成器
   if (!motion_generator_initialized_) {
     // After starting the controller we wait for valid joint states from the input topic
-    // Until we get valid joint states we will send zero torques to the robot
-    // to allow the user to reposition the robot
+    // Until we get valid joint states we will hold the current position
     motion_generator_initialized_ = initializeMotionGenerator_();
 
+    static bool hold_initialized = false;
+    static Vector7d q_hold;
     if (!motion_generator_initialized_) {
-      for (int i = 0; i < num_joints; ++i) {
-        command_interfaces_[i].set_value(0.0);
+      if (!hold_initialized) {
+        q_hold = q_;
+        hold_initialized = true;
+        RCLCPP_INFO(get_node()->get_logger(), "Position hold active until GELLO connects.");
       }
-
+      tau_d_calculated = calculateTauDGains_(q_hold);
+      for (int i = 0; i < num_joints; ++i) {
+        command_interfaces_[i].set_value(tau_d_calculated(i));
+      }
       return controller_interface::return_type::OK;
     }
+    hold_initialized = false;
   }
 
   if (!move_to_start_position_finished_) {
@@ -83,9 +91,11 @@ controller_interface::return_type JointImpedanceController::update(
   if (move_to_start_position_finished_) {
     // After reaching the start position we follow the joint position from the input topic
     // This is the normal operation mode of the controller
+    // 取消了自动shutdown，改为当gello位置值无效时发送警告并继续使用最后一个有效的gello位置值
     if (!gello_position_values_valid_) {
-      RCLCPP_FATAL(get_node()->get_logger(), "Timeout: No valid joint states received from Gello");
-      rclcpp::shutdown();  // Exit the node permanently
+      RCLCPP_WARN(get_node()->get_logger(),
+                  "Gello timeout: using new position after %.1fs gap.",
+                  (this->get_node()->now() - last_joint_state_time_).seconds());
     }
     for (int i = 0; i < num_joints; ++i) {
       q_goal(i) = gello_position_values_[i];
@@ -217,7 +227,7 @@ bool JointImpedanceController::validateGains_(const std::vector<double>& gains,
 }
 
 void JointImpedanceController::validateGelloPositions_(const sensor_msgs::msg::JointState& msg) {
-  const double max_time_diff = 0.5;
+  const double max_time_diff = 1.5; //gello判定阈值默认0.5秒，超过这个时间差就认为gello位置值无效
   auto current_time = get_node()->now();
   auto time_since_last_joint_state = (current_time - last_joint_state_time_).seconds();
   auto time_since_msg_stamp = (current_time - msg.header.stamp).seconds();
