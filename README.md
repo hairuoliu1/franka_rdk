@@ -25,8 +25,11 @@ workspace/
 │   ├── config/                          # 各类配置文件
 │   ├── robots/                          # LeRobot 机器人接口
 │   ├── teleoperators/                   # LeRobot 遥操作接口
-│   └── policies/                        # 策略模型 (OpenPI)
-├── tmp/                                 # 测试脚本
+│   ├── policies/                        # 策略模型 (OpenPI)
+│   ├── ros_bridge.py                    # Python 3.10 ROS 2 bridge 子进程
+│   └── ros_bridge_client.py             # LeRobot 主进程读取 bridge 输出
+├── test/                                # 测试与数据采集脚本
+│   ├── test_recording.py                # 双臂数据采集端到端测试
 │   ├── test_action_listener.py          # 监听 ROS action
 │   ├── fake_robot_action_publisher.py   # 模拟发送 action
 │   ├── test_obs_listener.py             # 监听 ROS observation
@@ -34,7 +37,7 @@ workspace/
 └── lerobot/                             # LeRobot 框架 (git submodule)
 ```
 
-> **lerobot 为 git submodule**，指向上游 [huggingface/lerobot](https://github.com/huggingface/lerobot)，本地修改通过 `patches/lerobot.patch` 管理。详见[子模块管理](#子模块管理)。
+> **lerobot 为 git submodule**，指向上游 [huggingface/lerobot](https://github.com/huggingface/lerobot)。当前仓库直接按子模块指针使用，不再需要额外应用本地 patch。
 
 ---
 
@@ -48,44 +51,23 @@ git clone --recursive <repo-url>
 git submodule update --init
 ```
 
-### 应用本地补丁
-
-补丁基于上游 commit `818892a38bbf` 生成，必须先让 submodule 回到该 commit：
+### 更新子模块
 
 ```bash
-# submodule update 会自动 checkout 到父仓库记录的 commit (818892a38bbf)
-git submodule update --init lerobot
-
-# 确认在正确 commit
-cd lerobot && git log -1 --oneline
-# 818892a3 feat(dagger): Add HIL/Dagger/HG-Dagger/RaC style data collection (#2833)
-
-# 应用本地补丁
-git apply ../patches/lerobot.patch
+git submodule update --init --recursive lerobot
+cd lerobot
 ```
 
-> 如果你 `cd lerobot && git pull` 到了更新的版本，patch 可能 conflict。此时需要先 `git checkout 818892a38bbf` 回到基准 commit 再 apply。
-
-### 修改 lerobot 后更新补丁
+如果需要升级 LeRobot，先在子模块内切换到目标 commit，再回到主仓库提交子模块指针：
 
 ```bash
 cd lerobot
-# ... 正常开发、git commit 你的修改 ...
-git diff 818892a3 > ../patches/lerobot.patch   # 导出相对于上游的补丁
-cd /workspace && git add patches/lerobot.patch && git commit -m "update lerobot patch"
+git fetch
+git checkout <target-commit-or-tag>
+cd ..
+git add lerobot
+git commit -m "update lerobot submodule"
 ```
-
-> 上游基准 commit：`818892a38bbfaa4c3ce7597d0db4504d730e51c7`（`main` 分支，`feat(dagger): Add HIL/Dagger/HG-Dagger/RaC style data collection (#2833)`）。如需跟踪更新版本，在 lerobot 内 `git pull` 后重新生成 patch。
-
-### 补丁内容概要
-
-| 文件 | 修改原因 |
-|---|---|
-| `pyproject.toml` | `requires-python` 从 3.12 降为 3.10 |
-| `motors_bus.py` | 类型注解兼容 Python 3.10 (`Union` 替代 `\|`) |
-| `policies/` | 路径适配、模型加载兼容 |
-| `cameras/realsense/` | ROS 相机接口适配 |
-| `datasets/streaming_dataset.py` | 数据集路径调整 |
 
 ---
 
@@ -99,69 +81,79 @@ cd /workspace && git add patches/lerobot.patch && git commit -m "update lerobot 
 | `gello_publisher.yaml` | GELLO 配置 (端口、偏移量、关节方向) |
 | `robotiq_gripper_config.yaml` | Robotiq 夹爪配置 (端口、namespace) |
 
-### fr3_config.yaml 示例
+### fr3_config.yaml 双臂示例
 
 ```yaml
-robot1:
+LEFT:
   arm_id: "fr3"
-  arm_prefix: ""
+  arm_prefix: "left"
   fake_sensor_commands: "false"
   joint_sources: ["joint_states", "franka_gripper/joint_states"]
   joint_state_rate: 30
   load_gripper: "true"
-  namespace: ""
+  namespace: "left"
+  robot_ip: "172.16.0.2"
+  urdf_file: "fr3/fr3.urdf.xacro"
+  use_fake_hardware: "false"
+  use_rviz: "false"
+
+RIGHT:
+  arm_id: "fr3"
+  arm_prefix: "right"
+  fake_sensor_commands: "false"
+  joint_sources: ["joint_states", "franka_gripper/joint_states"]
+  joint_state_rate: 30
+  load_gripper: "true"
+  namespace: "right"
   robot_ip: "172.16.0.3"
   urdf_file: "fr3/fr3.urdf.xacro"
   use_fake_hardware: "false"
   use_rviz: "false"
 ```
 
-### gello_publisher.yaml 示例
+### gello_publisher.yaml 双臂示例
 
 ```yaml
-SINGLE:
-  namespace: ""
+LEFT:
+  namespace: "left"
+  com_port: "usb-FTDI_USB__-__Serial_Converter_FTAWWGWP-if00-port0"
+  num_arm_joints: 7
+  joint_signs: [1, 1, 1, -1, 1, -1, 1]
+  gripper: true
+  assembly_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  gripper_range_rad: [2.307, 3.527]
+
+RIGHT:
+  namespace: "right"
   com_port: "usb-FTDI_USB__-__Serial_Converter_FTAWANP9-if00-port0"
   num_arm_joints: 7
   joint_signs: [1, -1, 1, -1, 1, -1, 1]
   gripper: true
-  assembly_offsets: [3.142, 0.0, 3.142, 4.712, 3.142, 1.571, -0.8]  # rad
+  assembly_offsets: [3.142, 0.0, 3.142, 4.712, 3.142, 1.571, 0.0]
   gripper_range_rad: [3.914, 5.134]
-  dynamixel_torque_enable: [0, 0, 0, 0, 0, 0, 0, 0]
-  dynamixel_goal_position: [0.0, 0.0, 0.0, -1.571, 0.0, 1.571, 0.0, 3.509]
-  dynamixel_kp_p: [30, 60, 0, 30, 0, 0, 0, 50]
-  dynamixel_kp_i: [0, 0, 0, 0, 0, 0, 0, 0]
-  dynamixel_kp_d: [250, 100, 80, 60, 30, 10, 5, 0]
 ```
 
 ---
 
 ## Python 环境说明
 
-LeRobot 最新版要求 Python 3.12，但 ROS 2 默认使用 Python 3.10。为避免冲突，将 UV 环境设为 3.10：
+ROS 2 Humble 默认使用 Python 3.10。当前数据采集链路也按 Python 3.10 运行：主进程加载 LeRobot，本地 `src/ros_bridge.py` 会用 `/usr/bin/python3.10` 作为 ROS bridge 子进程读取 ROS 2 话题。
 
-1. 修改 `lerobot/pyproject.toml` 中 `requires-python = ">=3.10"`
-2. 修改 `lerobot/src/lerobot/motors/motors_bus.py` 中的类型注解为兼容写法：
+确认环境：
 
-```python
-# 替换前 (仅 3.12+ 支持):
-# type NameOrID = str | int
-# type Value = int | float
-
-# 替换后 (兼容 3.10):
-from typing import Union
-NameOrID = Union[str, int]
-Value = Union[int, float]
+```bash
+cd /home/franka/franka_rdk
+python --version
+/usr/bin/python3.10 --version
 ```
+
+LeRobot 子模块直接按仓库记录的 commit 使用。克隆或切换分支后，先运行 `git submodule update --init --recursive lerobot`，再确认当前 Python 环境可以 import `lerobot`。
 
 常用命令：
 
 ```bash
-# 查看已安装的包
-/workspace/.venv/bin/python -m pip list
-
-# 激活虚拟环境
-source /workspace/.venv/bin/activate
+# 查看当前 Python 环境中的包
+python -m pip list
 
 # 清华镜像（已写入 ~/.bashrc）
 export UV_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -201,7 +193,7 @@ python3 get_offsets.py \
 - `--joint-signs`：电机方向符号，1 为正，-1 为反
 - `--port`：步骤 1 中找到的 GELLO 端口
 
-将输出的 `assembly_offsets`、`gripper_range_rad` 等值更新到 `gello_publisher.yaml`。
+将输出的 `assembly_offsets`、`gripper_range_rad` 等值更新到 `gello_publisher.yaml`。`gripper_range_rad[0]` 映射到夹爪控制百分比 `0.0`，`gripper_range_rad[1]` 映射到 `1.0`。
 
 ### 步骤 3：构建 ROS 2 工作空间
 
@@ -310,9 +302,9 @@ ros2 launch franka_gripper_manager robotiq_gripper_controller_client.launch.py \
 python -m src.robots.franka_fr3_robotiq_gripper.gripper_test
 ```
 
-Robotiq 2F-85 关节范围：`0.0` = 完全张开，`0.8` = 完全闭合（弧度制）。实际闭合读数约 `0.7894`。
+Robotiq 2F-85 夹爪 raw 范围：`0.0` = 完全张开，`0.085` = 最大闭合。控制 topic `/gripper/gripper_client/target_gripper_width_percent` 保持开口百分比语义：`1.0` = 张开，`0.0` = 闭合；采集链路把 action/observation 的 `joint_positions_7` 记录为 raw Robotiq 绝对位置。
 
-### 步骤 9：启动力传感器（可选）
+### 步骤 8：启动力传感器（可选）
 
 ```bash
 # 编译 (首次)
@@ -337,17 +329,19 @@ ros2 topic echo /robotiq_force_torque_sensor_broadcaster/wrench
 RealSense D405/D415 ──→ /cam1/rs1/color/image_rect_raw
                          /cam2/rs2/color/image_raw
 
-GELLO (Dynamixel) ──→ gello_publisher ──→ /gello/joint_states
+GELLO (Dynamixel) ──→ gello_publisher ──→ /left/gello/joint_states
+                                           /right/gello/joint_states
                                                │
                                                ▼
-                         joint_impedance_controller ──→ Franka FR3 (力矩)
+                         joint_impedance_controller ──→ left/right Franka FR3
 
-                         gripper_manager ──→ Robotiq 2F-85 (串口)
+                         gripper_manager ──→ /left/gripper/joint_states
+                                             /right/gripper/joint_states
 
 Robotiq FT Sensor ──→ /robotiq_force_torque_sensor_broadcaster/wrench
 ```
 
-> 注意：启动全部节点后的话题列表会多出 `/gello/joint_states`、`/franka_gripper/joint_states`、`/joint_impedance_controller/transition_event` 等。
+> 注意：启动全部节点后的话题列表会多出 `/left/gello/joint_states`、`/right/gello/joint_states`、`/left/franka/joint_states`、`/right/franka/joint_states` 等。
 
 ---
 
@@ -355,7 +349,7 @@ Robotiq FT Sensor ──→ /robotiq_force_torque_sensor_broadcaster/wrench
 
 **ROS 发布的 joint topic 中关节名称顺序不固定，切勿用 list 索引直接读取，必须通过字典查找。**
 
-实际观察到的 `/franka/joint_states` 顺序（注意 joint2 和 joint3 是反的）：
+实际观察到的 `/left/franka/joint_states` / `/right/franka/joint_states` 顺序可能如下（注意 joint2 和 joint3 是反的）：
 
 ```
 name:
@@ -386,111 +380,155 @@ arm = np.array(arm_positions, dtype=np.float32)
 
 ---
 
-## 数据录制 (LeRobot Record)
+## 数据采集
 
-### 架构说明
+### 正式采集入口
 
-遥操作通过 ROS 2 完成，LeRobot Record 运行在**旁路监听模式 (passive mode)**：仅从 ROS 话题读取 action 和 observation 用于记录，不向机械臂下发指令。
-
-```python
-# lerobot_record.py 中的旁路监听逻辑
-if policy is None and getattr(teleop, "is_passive", False):
-    # 仅记录 action, 不向机械臂下发, 避免与 ROS 控制冲突
-    _sent_action = robot_action_to_send
-else:
-    _sent_action = robot.send_action(robot_action_to_send)
-```
-
-### 放行 X11 图形权限
+正式数据采集使用 `/home/franka/franka_rdk/src/lerobot_record.py`，推荐用模块方式启动：
 
 ```bash
-xhost +local:docker
-# 或
-xhost +
+cd /home/franka/franka_rdk
+/home/franka/miniconda3/envs/lerobot/bin/python -m src.lerobot_record ...
 ```
 
-### 启动录制
+采集脚本使用双臂封装：
 
-录制前确保所有 ROS 节点均已启动（步骤 4-9）。
+- `BiFrankaFr3RobotiqGripper`：读取 left/right Franka state 和相机。
+- `BiGelloRosLeader`：被动监听 left/right GELLO action，不向机器人重复下发指令。
+- `src/ros_bridge.py`：由 Python 3.10 子进程读取 ROS 2 话题，并写入 `/dev/shm/lerobot_state_<namespace>.json`，避免 Python 3.12 环境直接 import `rclpy`。
 
-无相机录制：
+`src` 中的单臂 `franka_fr3_robotiq_gripper` 和 `gello_ros_leader` 默认使用左臂 namespace `left`。双臂封装里左臂沿用这个默认值，右臂配置显式覆盖为 `right`。
+
+默认检查的话题：
+
+| 数据 | 默认话题 |
+|---|---|
+| 左臂状态 | `/left/franka/joint_states` |
+| 右臂状态 | `/right/franka/joint_states` |
+| 左臂 GELLO | `/left/gello/joint_states` |
+| 右臂 GELLO | `/right/gello/joint_states` |
+| 左/右夹爪控制百分比 | `/left/gripper/gripper_client/target_gripper_width_percent`、`/right/gripper/gripper_client/target_gripper_width_percent` |
+| 左/右 GELLO 夹爪 raw 目标 | `/left/gello/gripper_position`、`/right/gello/gripper_position` |
+
+夹爪维度是 `left_joint_positions_7` / `right_joint_positions_7`。数据集中 observation 和 action 都采集 raw Robotiq 值：`0.0=张开，0.085=最大闭合`。控制链路仍通过 `target_gripper_width_percent` 发送开口百分比，采集 bridge 优先读取 `/gello/gripper_position`；如果旧版 GELLO publisher 尚未发布 raw topic，则临时从百分比 topic 换算成 raw 值。
+
+### 运行前准备
 
 ```bash
-python -m src.lerobot_record \
-    --robot.type=franka_fr3_robotiq_gripper \
-    --teleop.type=gello_ros_leader \
-    --dataset.repo_id=local/my_franka_dataset \
-    --dataset.root=/workspace/data/franka_exam1 \
-    --dataset.num_episodes=2 \
-    --dataset.single_task="Pick up the yellow block" \
-    --dataset.streaming_encoding=true \
-    --dataset.encoder_threads=2 \
-    --display_data=true \
-    --play_sounds=false \
-    --dataset.push_to_hub=false \
-    --dataset.vcodec=h264 \
-    --dataset.fps=15 \
-    --dataset.episode_time_s=60 \
-    --dataset.reset_time_s=0
+cd /home/franka/franka_rdk
+source /opt/ros/humble/setup.bash
+source ros2/install/setup.bash
+export ROS_DOMAIN_ID=0
 ```
 
-带相机录制：
+录制前确保 GELLO、Franka 控制器和 Robotiq 夹爪已按前文步骤启动。跨机器通信时，如果 multicast 发现不稳定，给 robot 配置传 `--robot.left_arm_config.remote_ip=<机器人侧IP>` 和 `--robot.right_arm_config.remote_ip=<机器人侧IP>`，脚本会临时写入 `CYCLONEDDS_URI`。
+
+### 采集一段双臂数据
+
+默认输出路径为 `$HF_LEROBOT_HOME/<repo_id>`；使用 `--dataset.root` 可指定本地目录。`src.lerobot_record` 是多 episode 交互式录制流程，按右方向键开始每个 episode，按 Esc 停止整个录制流程。
 
 ```bash
-python -m src.lerobot_record \
-    --robot.type=franka_fr3_robotiq_gripper \
-    --robot.cameras='{top: {type: intelrealsense, serial_number_or_name: "311122062207", width: 640, height: 480, fps: 30}}' \
-    --teleop.type=gello_ros_leader \
-    --dataset.repo_id=local/my_franka_dataset_top_only \
-    --dataset.root=/workspace/data/franka_exam_top_only \
-    --dataset.num_episodes=2 \
-    --dataset.single_task="Pick up the yellow block" \
-    --dataset.streaming_encoding=true \
-    --dataset.encoder_threads=1 \
-    --dataset.encoder_queue_maxsize=120 \
-    --display_data=false \
-    --play_sounds=false \
-    --dataset.push_to_hub=false \
-    --dataset.vcodec=h264 \
-    --dataset.fps=30 \
-    --dataset.episode_time_s=60 \
-    --dataset.reset_time_s=0
+cd /home/franka/franka_rdk
+/home/franka/miniconda3/envs/lerobot/bin/python -m src.lerobot_record \
+  --robot.type=bi_franka_fr3_robotiq_gripper \
+  --robot.left_arm_config.ros_domain_id=0 \
+  --robot.right_arm_config.ros_domain_id=0 \
+  --robot.left_arm_config.topic_namespace=left \
+  --robot.right_arm_config.topic_namespace=right \
+  --robot.left_arm_config.use_bridge=true \
+  --robot.right_arm_config.use_bridge=true \
+  --robot.left_arm_config.use_ft_sensor=false \
+  --robot.right_arm_config.use_ft_sensor=false \
+  --robot.left_arm_config.cameras='{left_camera: {type: opencv, index_or_path: "/dev/video0", width: 640, height: 480, fps: 30, warmup_s: 3, fourcc: "MJPG"}}' \
+  --robot.right_arm_config.cameras='{middle_zed: {type: zed2, serial_number: "<ZED_SERIAL>", width: 672, height: 376, fps: 30, warmup_s: 3}, right_camera: {type: opencv, index_or_path: "/dev/video2", width: 640, height: 480, fps: 30, warmup_s: 3, fourcc: "MJPG"}}' \
+  --teleop.type=bi_gello_ros_leader \
+  --teleop.left_arm_config.ros_domain_id=0 \
+  --teleop.right_arm_config.ros_domain_id=0 \
+  --teleop.left_arm_config.topic_namespace=left \
+  --teleop.right_arm_config.topic_namespace=right \
+  --teleop.left_arm_config.use_bridge=true \
+  --teleop.right_arm_config.use_bridge=true \
+  --dataset.repo_id=local/bimanual_franka_recording \
+  --dataset.num_episodes=5 \
+  --dataset.single_task="bimanual franka recording" \
+  --dataset.fps=30 \
+  --dataset.episode_time_s=60 \
+  --dataset.reset_time_s=0 \
+  --dataset.streaming_encoding=true \
+  --dataset.encoder_threads=2 \
+  --dataset.vcodec=auto \
+  --dataset.push_to_hub=false \
+  --display_data=false \
+  --play_sounds=false
 ```
 
-### 录制控制快捷键
+### 相机配置
 
-录制过程中通过键盘控制：
+当前采集只使用三路相机：中间是 ZED，左右两侧是 OpenCV。相机 key 必须全局唯一：
 
-| 按键 | 作用 |
-|------|------|
-| **→ 右方向键** | 提前结束当前循环 (`exit_early = True`) |
-| **← 左方向键** | 结束当前循环并标记重录该 episode (`rerecord_episode = True`) |
-| **Esc** | 停止整个录制流程 (`stop_recording = True`) |
+```bash
+--robot.left_arm_config.cameras='{left_camera: {type: opencv, index_or_path: "/dev/video0", width: 640, height: 480, fps: 30, warmup_s: 3, fourcc: "MJPG"}}'
+--robot.right_arm_config.cameras='{middle_zed: {type: zed2, serial_number: "<ZED_SERIAL>", width: 672, height: 376, fps: 30, warmup_s: 3}, right_camera: {type: opencv, index_or_path: "/dev/video2", width: 640, height: 480, fps: 30, warmup_s: 3, fourcc: "MJPG"}}'
+```
+
+如果当前 Python 环境没有安装 ZED SDK 的 `pyzed` 模块，`type: zed2` 会在导入或连接时失败，需要先安装 ZED SDK 和 Python bindings。
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--robot.left_arm_config.topic_namespace` / `--robot.right_arm_config.topic_namespace` | 单臂默认是 `left`；双臂采集时左臂为 `left`，右臂为 `right`，需要与 ROS 配置中的 namespace 一致。 |
+| `--robot.*.ros_domain_id` / `--teleop.*.ros_domain_id` | 设置 ROS_DOMAIN_ID。 |
+| `--robot.*.remote_ip` | 跨机器 DDS 显式 peer discovery fallback。 |
+| `--dataset.num_episodes` | 采集 episode 数量。 |
+| `--dataset.episode_time_s` | 每个 episode 录制时长。 |
+| `--dataset.reset_time_s` | episode 之间的 reset 时长。 |
+| `--dataset.streaming_encoding` | 实时编码视频，减少 `save_episode()` 等待时间。 |
 
 ### 可视化录制数据
 
 ```bash
-python -m lerobot.scripts.lerobot_dataset_viz \
-  --repo-id local/my_franka_dataset \
+/home/franka/miniconda3/envs/lerobot/bin/python -m lerobot.scripts.lerobot_dataset_viz \
+  --repo-id local/bimanual_franka_recording \
   --episode-index 0 \
-  --root /workspace/data/franka_exam1
+```
+
+录制控制快捷键：
+
+| 按键 | 作用 |
+|------|------|
+| **→ 右方向键** | 开始或提前结束当前循环 (`exit_early = True`) |
+| **← 左方向键** | 结束当前循环并标记重录该 episode (`rerecord_episode = True`) |
+| **Esc** | 停止整个录制流程 (`stop_recording = True`) |
+
+### 测试脚本
+
+`test/test_recording.py` 只用于端到端验证采集链路，不作为正式数据采集入口。它会录制一个短 episode，结束后重新加载数据集，检查 episode、frame 数量和视频文件是否完整。
+
+只验证 state/action 管线、不录相机：
+
+```bash
+/home/franka/miniconda3/envs/lerobot/bin/python test/test_recording.py \
+  --repo-id local/bimanual_franka_recording_no_camera \
+  --no-cameras \
+  --episode-s 3 \
+  --fps 15
 ```
 
 ### Observation/Action 测试工具
 
-`tmp/` 目录下的测试脚本用于验证 ROS 通信：
+`test/` 目录下的脚本用于单独验证 ROS 通信：
 
 | 脚本 | 用途 |
 |------|------|
-| `tmp/test_action_listener.py` | 监听 ROS 发布的 action |
-| `tmp/fake_robot_action_publisher.py` | 模拟发送 action |
-| `tmp/test_obs_listener.py` | 监听 ROS 发布的 observation |
-| `tmp/fake_robot_state_publisher.py` | 模拟发送 observation |
+| `test/test_action_listener.py` | 监听 GELLO action |
+| `test/fake_robot_action_publisher.py` | 模拟发送 action |
+| `test/test_obs_listener.py` | 监听 robot observation |
+| `test/fake_robot_state_publisher.py` | 模拟发送 observation |
 
 ```bash
-PYTHONPATH=/workspace python /workspace/tmp/test_gello_listener.py
-# 或模块模式
-python -m tmp.test_gello_listener
+python test/test_action_listener.py
+python test/test_obs_listener.py
 ```
 
 ---
@@ -504,7 +542,6 @@ python -m src.lerobot_record \
     --policy.host=http://127.0.0.1:8000 \
     --policy.default_prompt="Pick up the yellow block" \
     --dataset.repo_id=local/my_franka_policy_dataset \
-    --dataset.root=/workspace/data/franka_policy_exam1 \
     --dataset.num_episodes=2 \
     --dataset.single_task="Pick up the yellow block" \
     --dataset.streaming_encoding=true \
@@ -513,7 +550,7 @@ python -m src.lerobot_record \
     --play_sounds=false \
     --dataset.push_to_hub=false \
     --dataset.vcodec=h264 \
-    --dataset.fps=15 \
+    --dataset.fps=30 \
     --dataset.episode_time_s=60 \
     --dataset.reset_time_s=0
 ```
@@ -540,23 +577,33 @@ ros2 launch franka_gripper_manager robotiq_gripper_controller_client.launch.py \
 # ===== 终端 4: 力传感器 (可选) =====
 ros2 launch robotiq_ft_sensor_hardware ft_sensor_standalone.launch.py
 
-# ===== 终端 5: 数据录制 =====
-python -m src.lerobot_record \
-    --robot.type=franka_fr3_robotiq_gripper \
-    --teleop.type=gello_ros_leader \
-    --dataset.repo_id=local/my_franka_dataset \
-    --dataset.root=/workspace/data/franka_exam1 \
+# ===== 终端 5: 正式数据采集 =====
+cd /home/franka/franka_rdk
+/home/franka/miniconda3/envs/lerobot/bin/python -m src.lerobot_record \
+    --robot.type=bi_franka_fr3_robotiq_gripper \
+    --robot.left_arm_config.ros_domain_id=0 \
+    --robot.right_arm_config.ros_domain_id=0 \
+    --robot.left_arm_config.topic_namespace=left \
+    --robot.right_arm_config.topic_namespace=right \
+    --robot.left_arm_config.cameras='{left_camera: {type: opencv, index_or_path: "/dev/video0", width: 640, height: 480, fps: 30, warmup_s: 3, fourcc: "MJPG"}}' \
+    --robot.right_arm_config.cameras='{middle_zed: {type: zed2, serial_number: "<ZED_SERIAL>", width: 672, height: 376, fps: 30, warmup_s: 3}, right_camera: {type: opencv, index_or_path: "/dev/video2", width: 640, height: 480, fps: 30, warmup_s: 3, fourcc: "MJPG"}}' \
+    --teleop.type=bi_gello_ros_leader \
+    --teleop.left_arm_config.ros_domain_id=0 \
+    --teleop.right_arm_config.ros_domain_id=0 \
+    --teleop.left_arm_config.topic_namespace=left \
+    --teleop.right_arm_config.topic_namespace=right \
+    --dataset.repo_id=local/bimanual_franka_recording \
     --dataset.num_episodes=5 \
-    --dataset.single_task="Pick up the yellow block" \
+    --dataset.single_task="bimanual franka recording" \
+    --dataset.fps=30 \
+    --dataset.episode_time_s=60 \
+    --dataset.reset_time_s=0 \
     --dataset.streaming_encoding=true \
     --dataset.encoder_threads=2 \
-    --display_data=true \
-    --play_sounds=false \
+    --dataset.vcodec=auto \
     --dataset.push_to_hub=false \
-    --dataset.vcodec=h264 \
-    --dataset.fps=15 \
-    --dataset.episode_time_s=60 \
-    --dataset.reset_time_s=0
+    --display_data=false \
+    --play_sounds=false
 ```
 
 ---
@@ -637,10 +684,6 @@ https://frankarobotics.github.io/docs/compatibility.html
 ### Franka 逆运动学
 
 Franka 官方配置的 MoveIt 逆运动学求解器为 LMA (Levenberg-Marquardt Algorithm)。
-
-### TV 环境
-
-UV 虚拟环境位于 `/workspace/.venv`，使用 `source /workspace/.venv/bin/activate` 激活。
 
 ---
 

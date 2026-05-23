@@ -8,7 +8,7 @@ LEFT:
   joint_signs: [1, -1, 1, -1, 1, 1, 1]
   gripper: true
   assembly_offsets: [0.000, 0.000, 3.142, 3.142, 3.142, 4.712, 0.000] # rad
-  gripper_range_rad: [2.00, 3.22]
+  gripper_range_rad: [2.307, 3.527]
   # Optional Dynamixel control parameters for all arm joints (+ gripper):
   # Warning: If using the OpenRB-150 instead of the U2D2 communication converter,
   #          do not enable torque until an external 5V power supply is connected to the board's
@@ -27,7 +27,7 @@ RIGHT:
   joint_signs: [1, -1, 1, -1, 1, 1, 1]
   gripper: true
   assembly_offsets: [0.000, 0.000, 3.142, 3.142, 3.142, 4.712, 0.000] # rad
-  gripper_range_rad: [2.00, 3.22]
+  gripper_range_rad: [3.914, 5.134]
   # Optional Dynamixel control parameters for all arm joints (+ gripper):
   # Warning: If using the OpenRB-150 instead of the U2D2 communication converter,
   #          do not enable torque until an external 5V power supply is connected to the board's

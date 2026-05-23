@@ -6,6 +6,11 @@ from std_msgs.msg import Float32
 
 DEFAULT_GRIPPER_COMMAND_TOPIC = "gripper_client/target_gripper_width_percent"
 DEFAULT_MOVE_ACTION_TOPIC = "robotiq_gripper_controller/gripper_cmd"
+# GripperActionController commands robotiq_85_left_knuckle_joint in radians.
+ROBOTIQ_2F85_MAX_CLOSED_JOINT_POSITION = 0.8
+COMMAND_DEADBAND = 0.002
+MIN_OPEN_WIDTH_PERCENT = 0.0
+MAX_OPEN_WIDTH_PERCENT = 1.0
 
 
 class RobotiqGripperClient(Node):
@@ -20,19 +25,28 @@ class RobotiqGripperClient(Node):
         )
         self.action_client = ActionClient(self, GripperCommand, DEFAULT_MOVE_ACTION_TOPIC)
         self.action_client.wait_for_server()
-        self.last_width = -1.0
+        self.last_position = -1.0
         self.get_logger().info("Gripper action server is up and running")
 
     def gripper_state_callback(self, msg):
-        gripper_target_position = msg.data
-        if abs(gripper_target_position - self.last_width) < 0.02:
+        open_width_percent = max(
+            MIN_OPEN_WIDTH_PERCENT,
+            min(MAX_OPEN_WIDTH_PERCENT, float(msg.data)),
+        )
+        gripper_target_position = ROBOTIQ_2F85_MAX_CLOSED_JOINT_POSITION * (
+            1.0 - open_width_percent
+        )
+        if abs(gripper_target_position - self.last_position) < COMMAND_DEADBAND:
             return
         self.send_gripper_command(gripper_target_position)
 
     def send_gripper_command(self, gripper_position):
-        self.last_width = gripper_position
+        gripper_position = max(
+            0.0, min(ROBOTIQ_2F85_MAX_CLOSED_JOINT_POSITION, float(gripper_position))
+        )
+        self.last_position = gripper_position
         goal_msg = GripperCommand.Goal()
-        goal_msg.command.position = 1 - gripper_position  # Convert to 0-1 range
+        goal_msg.command.position = gripper_position
         goal_msg.command.max_effort = 1.0
         self.future = self.action_client.send_goal_async(goal_msg)
         self.future.add_done_callback(self.gripper_response_callback)

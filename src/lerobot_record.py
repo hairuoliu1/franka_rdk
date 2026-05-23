@@ -68,6 +68,8 @@ lerobot-record \
 """
 
 import logging
+import os
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -80,6 +82,7 @@ from lerobot.cameras import (  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera.configuration_reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.zed.configuration_zed import ZEDCameraConfig  # noqa: F401
 from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
@@ -154,9 +157,10 @@ from src.utils.import_utils import register_local_plugins
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
     repo_id: str
-    # A short but accurate description of the task performed during the recording (e.g. "Pick the Lego block and drop it in the box on the right.")
+    # A short but accurate description of the task performed during the recording.
+    # Example: "Pick the Lego block and drop it in the box on the right."
     single_task: str
-    # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
+    # Root directory where the dataset will be stored. If None, defaults to $HF_LEROBOT_HOME/repo_id.
     root: str | Path | None = None
     # Limit the frames per second.
     fps: int = 30
@@ -190,8 +194,8 @@ class DatasetRecordConfig:
     # or hardware-specific: 'h264_videotoolbox', 'h264_nvenc', 'h264_vaapi', 'h264_qsv'.
     # Use 'auto' to auto-detect the best available hardware encoder.
     vcodec: str = "libsvtav1"
-    # Enable streaming video encoding: encode frames in real-time during capture instead
-    # of writing PNG images first. Makes save_episode() near-instant. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding
+    # Enable streaming video encoding: encode frames in real time during capture instead
+    # of writing PNG images first. Makes save_episode() near-instant.
     streaming_encoding: bool = False
     # Maximum number of frames to buffer per camera when using streaming encoding.
     # ~1s buffer at 30fps. Provides backpressure if the encoder can't keep up.
@@ -245,6 +249,44 @@ class RecordConfig:
     def __get_path_fields__(cls) -> list[str]:
         """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
         return ["policy"]
+
+
+def _setup_dds_peer(remote_ip: str) -> str | None:
+    """Configure Cyclone DDS for explicit peer discovery as fallback when multicast fails.
+
+    Writes a temporary Cyclone DDS XML config that disables multicast and uses
+    the given remote IP as an explicit peer. Returns the temp file path, or None
+    on failure. The caller should keep the reference alive until done.
+    """
+    cyclonedds_uri = (
+        "<CycloneDDS>"
+        "<Domain><General><AllowMulticast>false</AllowMulticast></General>"
+        f"<Discovery><Peers><Peer Address=\"{remote_ip}\"/></Peers></Discovery>"
+        "</Domain></CycloneDDS>"
+    )
+    try:
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, prefix="cyclonedds_")
+        tmp.write(cyclonedds_uri)
+        tmp.close()
+        os.environ["CYCLONEDDS_URI"] = f"file://{tmp.name}"
+        logging.info("DDS peer discovery configured: remote=%s, config=%s", remote_ip, tmp.name)
+        return tmp.name
+    except OSError as exc:
+        logging.warning("Failed to write CycloneDDS config: %s. Falling back to default discovery.", exc)
+        return None
+
+
+def _first_config_attr(config: Any, attr: str) -> Any | None:
+    value = getattr(config, attr, None)
+    if value is not None:
+        return value
+
+    for child_attr in ("left_arm_config", "right_arm_config"):
+        child = getattr(config, child_attr, None)
+        value = getattr(child, attr, None)
+        if value is not None:
+            return value
+    return None
 
 
 """ --------------- record_loop() data flow --------------------------
@@ -328,7 +370,8 @@ def record_loop(
 
         if not (teleop_arm and teleop_keyboard and len(teleop) == 2 and robot.name == "lekiwi_client"):
             raise ValueError(
-                "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
+                "For multi-teleop, the list must contain exactly one KeyboardTeleop "
+                "and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
     # Reset policy and processor if they are provided
@@ -358,6 +401,8 @@ def record_loop(
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         # Get action from either policy or teleop
+        act_processed_policy = None
+        act_processed_teleop = None
         if policy is not None and preprocessor is not None and postprocessor is not None:
             action_values = predict_action(
                 observation=observation_frame,
@@ -408,13 +453,10 @@ def record_loop(
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        
-        # _sent_action = robot.send_action(robot_action_to_send)
-        
-        # 旁路监听模式
+        # TODO(steven, pepijn, adil): use a pipeline step to clip the action,
+        # so the sent action is the action input to the robot.
         if policy is None and getattr(teleop, "is_passive", False):
-            # 旁路监听模式：仅记录 action，不向机械臂下发真实命令，避免与底下 ROS 冲突
+            # Passive listeners record actions without re-sending commands to the live ROS controller.
             _sent_action = robot_action_to_send
         else:
             _sent_action = robot.send_action(robot_action_to_send)
@@ -435,7 +477,12 @@ def record_loop(
         sleep_time_s: float = 1 / fps - dt_s
         if sleep_time_s < 0:
             logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                "Record loop is running slower (%.1f Hz) than the target FPS (%s Hz). "
+                "Dataset frames might be dropped and robot control might be unstable. "
+                "Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long "
+                "3) CPU starvation",
+                1 / dt_s,
+                fps,
             )
 
         precise_sleep(max(sleep_time_s, 0.0))
@@ -450,8 +497,12 @@ def record_loop(
                     flush=True,
                 )
             else:
+                progress = (
+                    f"LOOP_PROGRESS phase={phase_label} episode_idx={episode_idx} "
+                    f"elapsed_s={timestamp:.1f} remaining_s={remaining_s:.1f}"
+                )
                 print(
-                    f"LOOP_PROGRESS phase={phase_label} episode_idx={episode_idx} elapsed_s={timestamp:.1f} remaining_s={remaining_s:.1f}",
+                    progress,
                     flush=True,
                 )
             last_logged_elapsed_s = elapsed_s
@@ -461,6 +512,23 @@ def record_loop(
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
     logging.info(pformat(asdict(cfg)))
+
+    # Set ROS_DOMAIN_ID early, before any rclpy.init() call.
+    # This enables cross-machine topic discovery between the local machine
+    # (cameras) and the remote machine (robot + Gello @ 172.16.0.4).
+    robot_domain = _first_config_attr(cfg.robot, "ros_domain_id")
+    teleop_domain = _first_config_attr(cfg.teleop, "ros_domain_id") if cfg.teleop else None
+    ros_domain = robot_domain if robot_domain is not None else teleop_domain
+    if ros_domain is not None:
+        os.environ["ROS_DOMAIN_ID"] = str(ros_domain)
+        logging.info("ROS_DOMAIN_ID set to %s (cross-machine mode)", ros_domain)
+
+    # Configure DDS peer discovery if remote_ip is set (fallback for networks without multicast)
+    dds_config_path: str | None = None
+    remote_ip = _first_config_attr(cfg.robot, "remote_ip")
+    if remote_ip is not None:
+        dds_config_path = _setup_dds_peer(remote_ip)
+
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
     display_compressed_images = (
@@ -552,7 +620,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
-                "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
+                "Streaming encoding is disabled. If you have capable hardware, consider enabling it "
+                "for faster episode saving. Example: --dataset.streaming_encoding=true "
+                "--dataset.encoder_threads=2 --dataset.vcodec=auto. More info: "
+                "https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
         with VideoEncodingManager(dataset):
@@ -565,7 +636,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     )
                 else:
                     logging.info(
-                        f"AWAIT_RIGHT idx={episode_idx} message='Press Right Arrow to start recording this episode'"
+                        "AWAIT_RIGHT idx=%s message='Press Right Arrow to start recording this episode'",
+                        episode_idx,
                     )
                     while not events["exit_early"] and not events["stop_recording"]:
                         time.sleep(0.05)
@@ -578,7 +650,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 episode_start_t = time.perf_counter()
                 logging.info(
-                    f"EPISODE_START idx={episode_idx} target_duration_s={cfg.dataset.episode_time_s} fps={cfg.dataset.fps}"
+                    "EPISODE_START idx=%s target_duration_s=%s fps=%s",
+                    episode_idx,
+                    cfg.dataset.episode_time_s,
+                    cfg.dataset.fps,
                 )
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
@@ -602,8 +677,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
                 episode_duration_s = time.perf_counter() - episode_start_t
                 logging.info(
-                    f"EPISODE_STOP idx={episode_idx} duration_s={episode_duration_s:.2f} "
-                    f"stop_recording={events['stop_recording']} rerecord={events['rerecord_episode']}"
+                    "EPISODE_STOP idx=%s duration_s=%.2f stop_recording=%s rerecord=%s",
+                    episode_idx,
+                    episode_duration_s,
+                    events["stop_recording"],
+                    events["rerecord_episode"],
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -613,7 +691,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 ):
                     reset_start_t = time.perf_counter()
                     logging.info(
-                        f"RESET_START idx={episode_idx} target_duration_s={cfg.dataset.reset_time_s}"
+                        "RESET_START idx=%s target_duration_s=%s",
+                        episode_idx,
+                        cfg.dataset.reset_time_s,
                     )
                     log_say("Reset the environment", cfg.play_sounds)
 
@@ -633,21 +713,24 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     )
                     reset_duration_s = time.perf_counter() - reset_start_t
                     logging.info(
-                        f"RESET_STOP idx={episode_idx} duration_s={reset_duration_s:.2f} "
-                        f"stop_recording={events['stop_recording']} rerecord={events['rerecord_episode']}"
+                        "RESET_STOP idx=%s duration_s=%.2f stop_recording=%s rerecord=%s",
+                        episode_idx,
+                        reset_duration_s,
+                        events["stop_recording"],
+                        events["rerecord_episode"],
                     )
 
                 if events["rerecord_episode"]:
-                    logging.info(f"EPISODE_RERECORD idx={episode_idx} action=discard_buffer")
+                    logging.info("EPISODE_RERECORD idx=%s action=discard_buffer", episode_idx)
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
                     continue
 
-                logging.info(f"EPISODE_SAVE_START idx={episode_idx}")
+                logging.info("EPISODE_SAVE_START idx=%s", episode_idx)
                 dataset.save_episode()
-                logging.info(f"EPISODE_SAVE_DONE idx={episode_idx}")
+                logging.info("EPISODE_SAVE_DONE idx=%s", episode_idx)
                 recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
@@ -663,7 +746,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if dds_config_path is not None:
+            try:
+                os.unlink(dds_config_path)
+            except OSError:
+                pass
+
+        if dataset is not None and cfg.dataset.push_to_hub:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
         log_say("Exiting", cfg.play_sounds)

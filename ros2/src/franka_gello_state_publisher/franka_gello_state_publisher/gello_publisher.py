@@ -31,6 +31,9 @@ class GelloPublisher(Node):
         self.gripper_joint_publisher = self.create_publisher(
             Float32, "gripper/gripper_client/target_gripper_width_percent", 10
         )
+        self.gripper_raw_publisher = self.create_publisher(
+            Float32, "gello/gripper_position", 10
+        )
 
         # Subscribe to parameter events to allow dynamic updates of parameters
         self.parameter_subscription = self.create_subscription(
@@ -63,7 +66,11 @@ class GelloPublisher(Node):
             "fr3_joint6",
             "fr3_joint7",
         ]
-        [gello_arm_joints, gripper_position] = self.gello_hardware.get_joint_and_gripper_positions()
+        (
+            gello_arm_joints,
+            gripper_open_percent,
+            gripper_position,
+        ) = self.gello_hardware.get_joint_and_gripper_positions()
 
         arm_joint_states = JointState()
         arm_joint_states.header.stamp = self.get_clock().now().to_msg()
@@ -72,9 +79,12 @@ class GelloPublisher(Node):
         arm_joint_states.position = gello_arm_joints.tolist()
 
         gripper_joint_states = Float32()
-        gripper_joint_states.data = gripper_position
+        gripper_joint_states.data = gripper_open_percent
+        gripper_raw_states = Float32()
+        gripper_raw_states.data = gripper_position
         self.arm_joint_publisher.publish(arm_joint_states)
         self.gripper_joint_publisher.publish(gripper_joint_states)
+        self.gripper_raw_publisher.publish(gripper_raw_states)
 
     def destroy_node(self) -> None:
         """Override the destroy_node method to disable torque mode before shutting down."""

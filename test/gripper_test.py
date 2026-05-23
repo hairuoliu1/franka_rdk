@@ -28,9 +28,9 @@ def main():
             
         print("\nReady to test gripper. The arm will maintain its current position.")
         
-        # 翻转两次夹爪来测试
-        for step in ["OPEN (0.0)", "CLOSE (0.8)", "OPEN (0.0)", "CLOSE (0.8)"]:
-            target_value = 0.0 if "0.0" in step else 0.8
+        # Robotiq raw 夹爪约定：0.0=张开，0.085=最大闭合。
+        for step in ["OPEN (0.0)", "CLOSE (0.085)", "OPEN (0.0)", "CLOSE (0.085)"]:
+            target_value = 0.085 if "0.085" in step else 0.0
             input(f"\nPress Enter to send gripper command: {step} ...")
             
             # 读取当前状态，只改变夹爪目标值

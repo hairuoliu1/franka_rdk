@@ -71,6 +71,8 @@ class DynamixelControlConfig:
 class GelloHardware:
     """Hardware interface for GELLO teleoperation device."""
 
+    ROBOTIQ_MAX_CLOSED_POSITION = 0.085
+
     # From https://frankarobotics.github.io/docs/robot_specifications.html#limits-for-franka-research-3-fr3
     JOINT_POSITION_LIMITS = np.array(
         [
@@ -217,13 +219,16 @@ class GelloHardware:
                 "goal_position", self._dynamixel_control_config["goal_position"]
             )
 
-    def get_joint_and_gripper_positions(self) -> tuple[np.ndarray, float]:
-        """Return a tuple containing the processed joint positions and gripper position percentage."""
+    def get_joint_and_gripper_positions(self) -> tuple[np.ndarray, float, float]:
+        """Return arm joints, open percent, and raw Robotiq target position."""
         joints_raw = self._driver.get_joints()
         arm_joints_raw = joints_raw[: self._num_arm_joints]
         gripper_position_raw = joints_raw[-1]
-        return self.process_arm_joint_positions(arm_joints_raw), self.process_gripper_position(
-            gripper_position_raw
+        open_percent = self.process_gripper_open_percent(gripper_position_raw)
+        return (
+            self.process_arm_joint_positions(arm_joints_raw),
+            open_percent,
+            self.gripper_open_percent_to_position(open_percent),
         )
 
     def process_arm_joint_positions(self, arm_joints_raw: np.ndarray) -> np.ndarray:
@@ -246,15 +251,26 @@ class GelloHardware:
         )
         return arm_joints_clipped
 
-    def process_gripper_position(self, gripper_position_raw: float) -> float:
-        """Convert and clamp raw gripper position to percentage (0-1). Return 0.0 if no gripper is present."""
+    def process_gripper_open_percent(self, gripper_position_raw: float) -> float:
+        """Map GELLO gripper motion to open-width percent: 1=open, 0=closed."""
         if not self._gripper:
-            return 0.0
-        gripper_position_percent = (gripper_position_raw - self._gripper_range_rad[0]) / (
+            return 1.0
+        # gripper_range_rad[0] maps to open-width percent 0.0, [1] maps to 1.0.
+        open_percent = (gripper_position_raw - self._gripper_range_rad[0]) / (
             self._gripper_range_rad[1] - self._gripper_range_rad[0]
         )
-        gripper_position_clipped = max(0.0, min(1.0, gripper_position_percent))
-        return gripper_position_clipped
+        return max(0.0, min(1.0, open_percent))
+
+    def gripper_open_percent_to_position(self, open_percent: float) -> float:
+        """Convert open-width percent to raw Robotiq position: 0=open, 0.085=max closed."""
+        open_percent = max(0.0, min(1.0, open_percent))
+        return self.ROBOTIQ_MAX_CLOSED_POSITION * (1.0 - open_percent)
+
+    def process_gripper_position(self, gripper_position_raw: float) -> float:
+        """Map GELLO gripper motion to raw Robotiq position: 0=open, 0.085=max closed."""
+        return self.gripper_open_percent_to_position(
+            self.process_gripper_open_percent(gripper_position_raw)
+        )
 
     def disable_torque(self) -> None:
         """Disable torque on all joints."""

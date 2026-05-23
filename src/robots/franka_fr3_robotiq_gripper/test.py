@@ -315,15 +315,17 @@ class FrankaFr3RobotiqGripper(Robot):
         sent: RobotAction = {f"joint_positions_{i}": float(arm[i]) for i in range(7)}
         if self.config.use_gripper:
             raw_gripper = float(action.get("joint_positions_7", self._last_sent_action["joint_positions_7"]))
-            gripper = float(np.clip(raw_gripper, 0.0, 1.0))
+            max_closed = getattr(self.config, "gripper_max_closed_position", None)
+            if max_closed is not None:
+                raw_gripper = float(np.clip(raw_gripper, 0.0, float(max_closed)))
             if self._gripper_pub is not None:
                 g_msg = Float32()
-                if getattr(self.config, "gripper_state_invert", False):
-                    g_msg.data = 1.0 - gripper
+                if max_closed is not None and float(max_closed) > 0.0:
+                    g_msg.data = 1.0 - (raw_gripper / float(max_closed))
                 else:
-                    g_msg.data = gripper
+                    g_msg.data = raw_gripper
                 self._gripper_pub.publish(g_msg)
-            sent["joint_positions_7"] = gripper
+            sent["joint_positions_7"] = raw_gripper
 
         self._last_sent_action.update(sent)
         return sent

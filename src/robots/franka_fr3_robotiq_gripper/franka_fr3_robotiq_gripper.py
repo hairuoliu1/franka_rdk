@@ -13,38 +13,45 @@
 # limitations under the License.
 
 import logging
+import os
 import time
 from pathlib import Path
 from threading import Event, Thread
 
 import draccus
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import JointState
-from geometry_msgs.msg import WrenchStamped
-from std_msgs.msg import Float32
 
-from lerobot.motors import MotorCalibration
-from lerobot.types import RobotAction, RobotObservation
-from lerobot.robots.robot import Robot
 from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.motors import MotorCalibration
+from lerobot.robots.robot import Robot
+from lerobot.types import RobotAction, RobotObservation
 
 from .config_franka_fr3_robotiq_gripper import FrankaFr3RobotiqGripperConfig
 
 logger = logging.getLogger(__name__)
 
+ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
+ROBOT_DOF = len(ARM_JOINT_NAMES) + 1
+WRENCH_AXES = ("fx", "fy", "fz", "tx", "ty", "tz")
+CAMERA_MAX_AGE_MS = 500
+
+
+def _namespaced(base_topic: str, namespace: str) -> str:
+    """Prepend namespace to a topic path."""
+    if not namespace:
+        return base_topic
+    ns = namespace.strip("/")
+    topic = base_topic.lstrip("/")
+    return f"/{ns}/{topic}"
+
 
 class FrankaFr3RobotiqGripper(Robot):
-    """
-    The base abstract class for all LeRobot-compatible robots.
+    """LeRobot-compatible robot for Franka FR3 with Robotiq gripper.
 
-    This class provides a standardized interface for interacting with physical robots.
-    Subclasses must implement all abstract methods and properties to be usable.
-
-    Attributes:
-        config_class (RobotConfig): The expected configuration class for this robot.
-        name (str): The unique robot name used to identify this robot type.
+    Supports two modes:
+    - Direct ROS 2 (rclpy): requires Python 3.10 (ROS 2 Humble ABI).
+    - Bridge mode: uses a Python 3.10 subprocess for ROS, communicates via
+      shared memory file. Required for Python 3.12+.
     """
 
     config_class = FrankaFr3RobotiqGripperConfig
@@ -53,88 +60,148 @@ class FrankaFr3RobotiqGripper(Robot):
     def __init__(self, config: FrankaFr3RobotiqGripperConfig):
         super().__init__(config)
         self.config = config
-        self.num_dofs = 8
+        self.num_dofs = ROBOT_DOF
         self._connected = False
-        self._joint_state_msg: JointState | None = None
-        self._gripper_state_msg: JointState | None = None
-        self._wrench_msg: WrenchStamped | None = None
+
+        # Bridge mode
+        self._use_bridge = getattr(self.config, "use_bridge", True)
+        self._bridge_client = None
+
+        # Direct ROS mode (requires Python 3.10)
+        self._joint_state_msg = None
+        self._gripper_state_msg = None
+        self._wrench_msg = None
         self._joint_sub = None
         self._gripper_sub = None
         self._wrench_sub = None
         self._arm_pub = None
         self._gripper_pub = None
-        self._node: Node | None = None
+        self._node = None
         self._spin_stop = Event()
-        self._spin_thread: Thread | None = None
+        self._spin_thread = None
+
         self._last_sent_action = {f"joint_positions_{i}": 0.0 for i in range(self.num_dofs)}
         self.cameras = make_cameras_from_configs(config.cameras)
+
+        # Resolve namespace and joint name prefix
+        self._ns = getattr(self.config, "topic_namespace", "")
+        prefix = getattr(self.config, "state_joint_prefix", "")
+        if not prefix and self._ns:
+            prefix = self._ns.rstrip("_") + "_"
+        self._state_joint_prefix = prefix
 
     def __str__(self) -> str:
         return f"{self.id} {self.__class__.__name__}"
 
     def __enter__(self):
-        """
-        Context manager entry.
-        Automatically connects to the camera.
-        """
         self.connect()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        """
-        Context manager exit.
-        Automatically disconnects, ensuring resources are released even on error.
-        """
         self.disconnect()
 
     def __del__(self) -> None:
-        """
-        Destructor safety net.
-        Attempts to disconnect if the object is garbage collected without cleanup.
-        """
         try:
             if self.is_connected:
                 self.disconnect()
-        except Exception:  # nosec B110
+        except Exception:
             pass
 
-    # 需要验证
-    def _joint_callback(self, msg: JointState) -> None:
+    # --- Bridge mode helpers ---
+
+    def _connect_bridge(self):
+        from src.ros_bridge_client import get_bridge_client
+
+        domain = getattr(self.config, "ros_domain_id", None)
+        if domain is not None:
+            os.environ["ROS_DOMAIN_ID"] = str(domain)
+        self._bridge_client = get_bridge_client(namespace=self._ns)
+        connected_cameras = []
+        try:
+            self._bridge_client.connect()
+            for cam in self.cameras.values():
+                cam.connect()
+                connected_cameras.append(cam)
+            self._connected = True
+        except Exception:
+            for cam in reversed(connected_cameras):
+                try:
+                    cam.disconnect()
+                except Exception:
+                    pass
+            if self._bridge_client is not None:
+                self._bridge_client.disconnect()
+                self._bridge_client = None
+            raise
+
+    def _get_obs_bridge(self) -> RobotObservation:
+        obs = dict(self._bridge_client.get_observation())
+        for cam_name, cam in self.cameras.items():
+            obs[cam_name] = self._read_camera_frame(cam)
+        return obs
+
+    def _send_action_bridge(self, action: RobotAction) -> RobotAction:
+        # In bridge mode we only record, never command the robot.
+        sent = {
+            f"joint_positions_{i}": float(action[f"joint_positions_{i}"])
+            for i in range(ROBOT_DOF)
+        }
+        self._last_sent_action.update(sent)
+        return sent
+
+    def _disconnect_bridge(self):
+        if self._bridge_client is not None:
+            self._bridge_client.disconnect()
+            self._bridge_client = None
+
+    # --- Direct ROS mode ---
+
+    def _joint_callback(self, msg):
         self._joint_state_msg = msg
 
-    def _gripper_joint_callback(self, msg: JointState) -> None:
+    def _gripper_joint_callback(self, msg):
         self._gripper_state_msg = msg
 
-    def _wrench_callback(self, msg: WrenchStamped) -> None:
+    def _wrench_callback(self, msg):
         self._wrench_msg = msg
 
+    def _spin_ros(self) -> None:
+        import rclpy
+        while not self._spin_stop.is_set() and rclpy.ok() and self._node is not None:
+            rclpy.spin_once(self._node, timeout_sec=0.05)
+
     def _get_gripper_observation(self) -> float:
-        """Read gripper state from joint states topic with fallback to last commanded value."""
         if self._gripper_state_msg is not None and self._gripper_state_msg.position:
             idx = int(getattr(self.config, "gripper_state_joint_index", 0))
             if 0 <= idx < len(self._gripper_state_msg.position):
                 return float(self._gripper_state_msg.position[idx])
-
         return float(self._last_sent_action.get("joint_positions_7", 0.0))
 
-    def _spin_ros(self) -> None:
-        while not self._spin_stop.is_set() and rclpy.ok() and self._node is not None:
-            rclpy.spin_once(self._node, timeout_sec=0.05)
+    def _read_arm_observation(self) -> np.ndarray:
+        if self._joint_state_msg is None:
+            return np.zeros(len(ARM_JOINT_NAMES), dtype=np.float32)
+
+        positions_by_name = dict(zip(self._joint_state_msg.name, self._joint_state_msg.position))
+        arm_positions = []
+        for joint_name in ARM_JOINT_NAMES:
+            prefixed_name = f"{self._state_joint_prefix}{joint_name}"
+            value = positions_by_name.get(prefixed_name, positions_by_name.get(joint_name, 0.0))
+            arm_positions.append(value)
+        return np.array(arm_positions, dtype=np.float32)
+
+    def _read_camera_frame(self, cam):
+        try:
+            return cam.read_latest(max_age_ms=CAMERA_MAX_AGE_MS)
+        except (NotImplementedError, AttributeError, TimeoutError, RuntimeError):
+            return cam.read()
+
+    # --- Public interface ---
 
     @property
     def observation_features(self) -> dict:
-        """
-        A dictionary describing the structure and types of the observations produced by the robot.
-        Its structure (keys) should match the structure of what is returned by :pymeth:`get_observation`.
-        Values for the dict should either be:
-            - The type of the value if it's a simple value, e.g. `float` for single proprioceptive value (a joint's position/velocity)
-            - A tuple representing the shape if it's an array-type value, e.g. `(height, width, channel)` for images
-
-        Note: this property should be able to be called regardless of whether the robot is connected or not.
-        """
-        features = {f"joint_positions_{i}": float for i in range(8)}
+        features = {f"joint_positions_{i}": float for i in range(ROBOT_DOF)}
         if getattr(self.config, "use_ft_sensor", False):
-            for w in ["fx", "fy", "fz", "tx", "ty", "tz"]:
+            for w in WRENCH_AXES:
                 features[f"wrench_{w}"] = float
         if hasattr(self.config, "cameras") and self.config.cameras:
             for cam_name, cam_cfg in self.config.cameras.items():
@@ -143,63 +210,74 @@ class FrankaFr3RobotiqGripper(Robot):
 
     @property
     def action_features(self) -> dict:
-        """
-        A dictionary describing the structure and types of the actions expected by the robot. Its structure
-        (keys) should match the structure of what is passed to :pymeth:`send_action`. Values for the dict
-        should be the type of the value if it's a simple value, e.g. `float` for single proprioceptive value
-        (a joint's goal position/velocity)
-
-        Note: this property should be able to be called regardless of whether the robot is connected or not.
-        """
-        return {f"joint_positions_{i}": float for i in range(8)}
+        return {f"joint_positions_{i}": float for i in range(ROBOT_DOF)}
 
     @property
     def is_connected(self) -> bool:
-        """
-        Whether the robot is currently connected or not. If `False`, calling :pymeth:`get_observation` or
-        :pymeth:`send_action` should raise an error.
-        """
         return self._connected
 
     def connect(self, calibrate: bool = True) -> None:
-        """
-        Establish communication with the robot.
-
-        Args:
-            calibrate (bool): If True, automatically calibrate the robot after connecting if it's not
-                calibrated or needs calibration (this is hardware-dependant).
-        """
         if self._connected:
             return
 
+        if self._use_bridge:
+            self._connect_bridge()
+            return
+
+        # Direct ROS 2 mode
+        import rclpy
+        from rclpy.node import Node
+        from sensor_msgs.msg import JointState as JointStateMsg
+        from geometry_msgs.msg import WrenchStamped as WrenchStampedMsg
+        from std_msgs.msg import Float32 as Float32Msg
+
         if not rclpy.ok():
+            domain = getattr(self.config, "ros_domain_id", None)
+            if domain is not None:
+                os.environ["ROS_DOMAIN_ID"] = str(domain)
             rclpy.init()
 
-        self._node = Node("franka_fr3_robotiq_gripper")
+        ns = self._ns
+        arm_state_topic = _namespaced(self.config.arm_state_topic, ns)
+        gripper_state_topic = _namespaced(self.config.gripper_state_topic, ns)
+        arm_command_topic = _namespaced(self.config.arm_command_topic, ns)
+        gripper_command_topic = _namespaced(self.config.gripper_command_topic, ns)
+
+        node_name = f"franka_fr3_{ns}" if ns else "franka_fr3_robotiq_gripper"
+        self._node = Node(node_name)
+
         self._joint_sub = self._node.create_subscription(
-            JointState,
-            self.config.arm_state_topic,
+            JointStateMsg,
+            arm_state_topic,
             self._joint_callback,
             10,
         )
         self._gripper_sub = self._node.create_subscription(
-            JointState,
-            self.config.gripper_state_topic,
+            JointStateMsg,
+            gripper_state_topic,
             self._gripper_joint_callback,
             10,
         )
         if getattr(self.config, "use_ft_sensor", False):
+            ft_topic = _namespaced(self.config.ft_sensor_topic, ns)
             self._wrench_sub = self._node.create_subscription(
-                WrenchStamped,
-                self.config.ft_sensor_topic,
+                WrenchStampedMsg,
+                ft_topic,
                 self._wrench_callback,
                 10,
             )
-        self._arm_pub = self._node.create_publisher(JointState, self.config.arm_command_topic, 10)
-        self._gripper_pub = self._node.create_publisher(
-            Float32,
-            self.config.gripper_command_topic,
-            10,
+
+        self._arm_pub = self._node.create_publisher(JointStateMsg, arm_command_topic, 10)
+        self._gripper_pub = self._node.create_publisher(Float32Msg, gripper_command_topic, 10)
+
+        logger.info(
+            "Connecting %s: ns=%s, arm_state=%s, arm_cmd=%s, gripper_state=%s, gripper_cmd=%s",
+            self.name,
+            ns or "none",
+            arm_state_topic,
+            arm_command_topic,
+            gripper_state_topic,
+            gripper_command_topic,
         )
 
         for cam in self.cameras.values():
@@ -210,80 +288,40 @@ class FrankaFr3RobotiqGripper(Robot):
         self._spin_thread.start()
 
         t0 = time.time()
-        # 允许夹爪启动不依赖机械臂状态，放宽连接检查，没接到joint_state也不阻塞
-        while self._gripper_state_msg is None and time.time() - t0 < 2.0:
+        while self._joint_state_msg is None and time.time() - t0 < 3.0:
             time.sleep(0.02)
 
         self._connected = True
 
     @property
     def is_calibrated(self) -> bool:
-        """Whether the robot is currently calibrated or not. Should be always `True` if not applicable"""
         return True
 
     def calibrate(self) -> None:
-        """
-        Calibrate the robot if applicable. If not, this should be a no-op.
-
-        This method should collect any necessary data (e.g., motor offsets) and update the
-        :pyattr:`calibration` dictionary accordingly.
-        """
         return
 
     def _load_calibration(self, fpath: Path | None = None) -> None:
-        """
-        Helper to load calibration data from the specified file.
-
-        Args:
-            fpath (Path | None): Optional path to the calibration file. Defaults to `self.calibration_fpath`.
-        """
         fpath = self.calibration_fpath if fpath is None else fpath
         with open(fpath) as f, draccus.config_type("json"):
             self.calibration = draccus.load(dict[str, MotorCalibration], f)
 
     def _save_calibration(self, fpath: Path | None = None) -> None:
-        """
-        Helper to save calibration data to the specified file.
-
-        Args:
-            fpath (Path | None): Optional path to save the calibration file. Defaults to `self.calibration_fpath`.
-        """
         fpath = self.calibration_fpath if fpath is None else fpath
         with open(fpath, "w") as f, draccus.config_type("json"):
             draccus.dump(self.calibration, f, indent=4)
 
     def configure(self) -> None:
-        """
-        Apply any one-time or runtime configuration to the robot.
-        This may include setting motor parameters, control modes, or initial state.
-        """
         return
 
     def get_observation(self) -> RobotObservation:
-        """
-        Retrieve the current observation from the robot.
-
-        Returns:
-            RobotObservation: A flat dictionary representing the robot's current sensory state. Its structure
-                should match :pymeth:`observation_features`.
-        """
-
         if not self._connected:
             raise RuntimeError("Robot is not connected. Call connect() first.")
 
-        if self._joint_state_msg is None:
-            arm = np.zeros(7, dtype=np.float32)
-        else:
-            arm_positions = []
-            for i in range(1, 8):
-                joint_name = f"fr3_joint{i}"
-                if joint_name in self._joint_state_msg.name:
-                    idx = self._joint_state_msg.name.index(joint_name)
-                    arm_positions.append(self._joint_state_msg.position[idx])
-                else:
-                    arm_positions.append(0.0)
-            arm = np.array(arm_positions, dtype=np.float32)
+        if self._use_bridge:
+            return self._get_obs_bridge()
 
+        # Direct ROS mode
+        arm = self._read_arm_observation()
         gripper = self._get_gripper_observation()
         joints = np.append(arm, gripper)
 
@@ -293,7 +331,7 @@ class FrankaFr3RobotiqGripper(Robot):
 
         if getattr(self.config, "use_ft_sensor", False):
             if self._wrench_msg is None:
-                for w in ["fx", "fy", "fz", "tx", "ty", "tz"]:
+                for w in WRENCH_AXES:
                     obs[f"wrench_{w}"] = 0.0
             else:
                 f = self._wrench_msg.wrench.force
@@ -306,66 +344,70 @@ class FrankaFr3RobotiqGripper(Robot):
                 obs["wrench_tz"] = float(t.z)
 
         for cam_name, cam in self.cameras.items():
-            obs[cam_name] = cam.read()
+            obs[cam_name] = self._read_camera_frame(cam)
 
         return obs
 
     def send_action(self, action: RobotAction) -> RobotAction:
-        """
-        Send an action command to the robot.
-
-        Args:
-            action (RobotAction): Dictionary representing the desired action. Its structure should match
-                :pymeth:`action_features`.
-
-        Returns:
-            RobotAction: The action actually sent to the motors potentially clipped or modified, e.g. by
-                safety limits on velocity.
-        """
-        if not self._connected or self._node is None or self._arm_pub is None:
+        if not self._connected:
             raise RuntimeError("Robot is not connected. Call connect() first.")
 
-        arm = np.array([float(action[f"joint_positions_{i}"]) for i in range(7)], dtype=np.float32)
+        if self._use_bridge:
+            return self._send_action_bridge(action)
 
-        arm_msg = JointState()
+        # Direct ROS mode
+        if self._node is None or self._arm_pub is None:
+            raise RuntimeError("Robot is not connected. Call connect() first.")
+
+        from sensor_msgs.msg import JointState as JointStateMsg
+        from std_msgs.msg import Float32 as Float32Msg
+
+        arm = np.array(
+            [float(action[f"joint_positions_{i}"]) for i in range(len(ARM_JOINT_NAMES))],
+            dtype=np.float32,
+        )
+
+        arm_msg = JointStateMsg()
         arm_msg.header.stamp = self._node.get_clock().now().to_msg()
         arm_msg.header.frame_id = "fr3_link0"
-        arm_msg.name = [
-            "fr3_joint1",
-            "fr3_joint2",
-            "fr3_joint3",
-            "fr3_joint4",
-            "fr3_joint5",
-            "fr3_joint6",
-            "fr3_joint7",
-        ]
+        arm_msg.name = list(ARM_JOINT_NAMES)
         arm_msg.position = [float(v) for v in arm]
         self._arm_pub.publish(arm_msg)
 
-        sent: RobotAction = {f"joint_positions_{i}": float(arm[i]) for i in range(7)}
+        sent: RobotAction = {
+            f"joint_positions_{i}": float(arm[i])
+            for i in range(len(ARM_JOINT_NAMES))
+        }
         if self.config.use_gripper:
             raw_gripper = float(action.get("joint_positions_7", self._last_sent_action["joint_positions_7"]))
-            gripper = float(np.clip(raw_gripper, 0.0, 1.0))
+            max_closed = getattr(self.config, "gripper_max_closed_position", None)
+            if max_closed is not None:
+                raw_gripper = float(np.clip(raw_gripper, 0.0, float(max_closed)))
             if self._gripper_pub is not None:
-                g_msg = Float32()
-                if getattr(self.config, "gripper_state_invert", False):
-                    g_msg.data = 1.0 - gripper
+                g_msg = Float32Msg()
+                if max_closed is not None and float(max_closed) > 0.0:
+                    g_msg.data = 1.0 - (raw_gripper / float(max_closed))
                 else:
-                    g_msg.data = gripper
+                    g_msg.data = raw_gripper
                 self._gripper_pub.publish(g_msg)
-            sent["joint_positions_7"] = gripper
+            sent["joint_positions_7"] = raw_gripper
 
         self._last_sent_action.update(sent)
         return sent
 
     def disconnect(self) -> None:
-        """Disconnect from the robot and perform any necessary cleanup."""
         if not self._connected:
             return
 
         for cam in self.cameras.values():
             cam.disconnect()
 
+        if self._use_bridge:
+            self._disconnect_bridge()
+            self._connected = False
+            return
+
+        # Direct ROS mode cleanup
         self._spin_stop.set()
         if self._spin_thread is not None:
             self._spin_thread.join(timeout=1.0)
@@ -376,6 +418,7 @@ class FrankaFr3RobotiqGripper(Robot):
 
         self._joint_sub = None
         self._gripper_sub = None
+        self._wrench_sub = None
         self._arm_pub = None
         self._gripper_pub = None
         self._connected = False

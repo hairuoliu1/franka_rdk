@@ -27,6 +27,7 @@ class FakeGelloPublisher(Node):
         self.gripper_joint_publisher = self.create_publisher(
             Float32, "gripper/gripper_client/target_gripper_width_percent", 10
         )
+        self.gripper_raw_publisher = self.create_publisher(Float32, "gello/gripper_position", 10)
 
         self.get_logger().info("Publishing FAKE GELLO joint states for testing.")
         self.timer = self.create_timer(1 / self.PUBLISHING_RATE, self.publish_joint_jog)
@@ -39,9 +40,9 @@ class FakeGelloPublisher(Node):
         # 关节角度小范围规律变化，振幅为 0.1 rad
         joints = [0.1 * math.sin(t + i) for i in range(7)]
         
-        # 夹爪在 0 到 0.8 之间连续平滑变化
+        # Robotiq raw gripper target: 0.0=open, 0.085=max closed.
         # math.sin 范围是 [-1, 1], (sin + 1)/2 范围是 [0, 1]
-        gripper = 0.8 * ((math.sin(t * 1.5) + 1.0) / 2.0)
+        gripper = 0.085 * ((math.sin(t * 1.5) + 1.0) / 2.0)
         
         return joints, gripper
 
@@ -56,18 +57,25 @@ class FakeGelloPublisher(Node):
         arm_joint_states.header.frame_id = "fr3_link0"
         arm_joint_states.position = [float(v) for v in gello_arm_joints]
 
-        # 发布夹爪状态
+        # Publish gripper control as open-width percent, and raw position for recording.
+        gripper_position = float(min(0.085, max(0.0, gripper_position)))
         gripper_joint_states = Float32()
-        
-        # 保留了您之前要求的反转逻辑：1.0 - 实际位置
-        gripper_joint_states.data = 1.0 - float(min(1.0, max(0.0, gripper_position))) 
+        gripper_joint_states.data = 1.0 - (gripper_position / 0.085)
+        gripper_raw_states = Float32()
+        gripper_raw_states.data = gripper_position
         
         self.arm_joint_publisher.publish(arm_joint_states)
         self.gripper_joint_publisher.publish(gripper_joint_states)
+        self.gripper_raw_publisher.publish(gripper_raw_states)
         
         # 防止刷屏，可以一秒钟打印一次状态 (约30帧)
         if int(t := (time.time() - self.start_time) * self.PUBLISHING_RATE) % 30 == 0:
-            self.get_logger().info(f"Fake output -> Arm: {[round(j, 3) for j in gello_arm_joints]}, Gripper target: {gripper_position:.3f} (Published: {gripper_joint_states.data:.3f})")
+            self.get_logger().info(
+                "Fake output -> Arm: %s, Gripper target raw: %.3f, open percent: %.3f",
+                [round(j, 3) for j in gello_arm_joints],
+                gripper_raw_states.data,
+                gripper_joint_states.data,
+            )
 
 def main(args=None):
     rclpy.init(args=args)

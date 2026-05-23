@@ -18,7 +18,7 @@ def test_listener():
     rclpy.init()
 
     print("创建 GelloRosLeader 实例并连接...")
-    # 使用默认配置，也就是监听 "/gello/joint_states" 和 "/gripper/gripper_client/target_gripper_width_percent"
+    # 使用默认配置，监听 GELLO arm 和 Robotiq raw gripper target 话题。
     teleop = GelloRosLeader(GelloRosLeaderConfig())
     teleop.connect()
 

@@ -32,3 +32,5 @@ list/
 ros2/src/rq_fts_ros2_driver/
 
 .claude
+.agents
+.codex

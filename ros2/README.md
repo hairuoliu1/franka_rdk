@@ -29,7 +29,7 @@ This package provides a ROS 2 node that reads input from the GELLO and publishes
 This package provides a ROS 2 node for managing the gripper connected to the Franka robot. Supported grippers are either the `Franka Hand` or the `Robotiq 2F-85`. It allows sending commands to control the gripper's width and perform homing actions. 
 
 #### Key Features:
-- Subscribes to `/gripper/gripper_client/target_gripper_width_percent` for gripper width commands.
+- Subscribes to `/gripper/gripper_client/target_gripper_width_percent` for gripper commands. Payload is open-width percent (`1.0` open, `0.0` closed). Recording code stores Robotiq raw position separately as `joint_positions_7` (`0.0` open, `0.085` max closed).
 - Supports homing and move actions for the gripper.
 
 #### Launch Files:
@@ -123,7 +123,7 @@ colcon build
 If you have assembled the GELLO yourself, you need to determine the following parameters for your specific assembly:
 - `joint_signs`: Multiplicative signs for each joint. If assembled according to the instructions, this should be `1 -1 1 -1 1 1 1` for the Franka GELLO. If you notice that some joints move in the opposite direction than expected, you may need to change the corresponding sign.
 - `assembly_offsets`: Since the Dynamixel flanges allow for 4 possible mounting orientations, the zero position of the joints may be offset by a multiple of pi/2 (= 90°). This parameter allows you to compensate for these offsets.
-- `gripper_range_rad`: Similarly, the joint angles corresponding to a fully open and fully closed gripper may differ based on the assembly.
+- `gripper_range_rad`: GELLO gripper joint angle range. `gripper_range_rad[0]` maps to open-width percent `0.0`; `gripper_range_rad[1]` maps to `1.0`.
 
 Use the `get_offsets.py` script in `/ros2/src/franka_gello_state_publisher/scripts/` to determine the `assembly_offsets` and `gripper_range_rad` parameters for your specific assembly.
 
@@ -286,4 +286,3 @@ If this helps, you can add a permanent udev rule:
 ## Acknowledgements
 The source code for the Robotiq gripper control is based on
 [ros2_robotiq_gripper](https://github.com/PickNikRobotics/ros2_robotiq_gripper.git), licensed under the BSD 3-Clause license.
-

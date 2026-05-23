@@ -35,6 +35,7 @@ def test_observation():
             # obs 的 key 是 "joint_positions_0" 到 "joint_positions_7" 共 8 个自由度
             # 前 7 个是机械臂关节，第 8 个是夹爪状态
             arm_joints = [obs[f"joint_positions_{j}"] for j in range(7)]
+            # joint_positions_7 使用 Robotiq raw 值：0.0=张开，0.085=最大闭合。
             gripper_state = obs.get("joint_positions_7", 0.0)
 
             print(f"[Obs Iter {i:03d}] Arm: {[round(v, 3) for v in arm_joints]}, Gripper: {gripper_state:.3f}")

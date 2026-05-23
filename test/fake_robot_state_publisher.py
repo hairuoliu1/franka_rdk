@@ -38,8 +38,8 @@ class FakeRobotStatePublisher(Node):
         arm_state_msg.name = self.arm_joint_names
         arm_state_msg.position = [float(v) for v in arm_joints]
         
-        # 2. 伪造夹爪状态 (Robotiq的真实反馈是角度, 所以我们发一个0.0到0.8之间变化的值)
-        gripper_pos = 0.8 * ((math.sin(t * 2.0) + 1.0) / 2.0)
+        # 2. 伪造 Robotiq raw joint state: 0.0=张开，0.085=最大闭合。
+        gripper_pos = 0.085 * ((math.sin(t * 2.0) + 1.0) / 2.0)
         
         gripper_state_msg = JointState()
         gripper_state_msg.header.stamp = self.get_clock().now().to_msg()
