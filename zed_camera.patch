@@ -1,0 +1,635 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 000000000..000000000 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -135,6 +135,7 @@ intelrealsense = [
+     "pyrealsense2>=2.55.1.6486,<2.57.0 ; sys_platform != 'darwin'",
+     "pyrealsense2-macosx>=2.54,<2.57.0 ; sys_platform == 'darwin'",
+ ]
++zed = []
+ phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
+ 
+ # Policies
+diff --git a/src/lerobot/async_inference/robot_client.py b/src/lerobot/async_inference/robot_client.py
+index 000000000..000000000 100644
+--- a/src/lerobot/async_inference/robot_client.py
++++ b/src/lerobot/async_inference/robot_client.py
+@@ -49,6 +49,7 @@ import torch
+ 
+ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
++from lerobot.cameras.zed.configuration_zed import ZEDCameraConfig  # noqa: F401
+ from lerobot.robots import (  # noqa: F401
+     Robot,
+     RobotConfig,
+diff --git a/src/lerobot/cameras/zed/__init__.py b/src/lerobot/cameras/zed/__init__.py
+new file mode 100644
+index 000000000..000000000
+--- /dev/null
++++ b/src/lerobot/cameras/zed/__init__.py
+@@ -0,0 +1,18 @@
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from .camera_zed import ZEDCamera
++from .configuration_zed import ZEDCameraConfig
++
++__all__ = ["ZEDCamera", "ZEDCameraConfig"]
+diff --git a/src/lerobot/cameras/zed/camera_zed.py b/src/lerobot/cameras/zed/camera_zed.py
+new file mode 100644
+index 000000000..000000000
+--- /dev/null
++++ b/src/lerobot/cameras/zed/camera_zed.py
+@@ -0,0 +1,283 @@
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Provides the ZEDCamera class for capturing frames from Stereolabs ZED cameras.
++"""
++
++import logging
++import time
++from threading import Event, Lock, Thread
++from typing import Any
++
++import cv2
++from numpy.typing import NDArray
++
++try:
++    import pyzed.sl as sl
++except Exception as e:
++    sl = None
++    _PYZED_IMPORT_ERROR = e
++else:
++    _PYZED_IMPORT_ERROR = None
++
++from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
++from lerobot.utils.errors import DeviceNotConnectedError
++
++from ..camera import Camera
++from ..configs import ColorMode
++from ..utils import get_cv2_rotation
++from .configuration_zed import ZEDCameraConfig
++
++logger = logging.getLogger(__name__)
++
++_RES_WH = {
++    "HD2K": (2208, 1242),
++    "HD1200": (1920, 1200),
++    "HD1080": (1920, 1080),
++    "HD720": (1280, 720),
++    "SVGA": (960, 600),
++    "VGA": (672, 376),
++}
++
++
++def _require_pyzed() -> Any:
++    if sl is None:
++        raise ImportError(
++            "pyzed is not available. Install the Stereolabs ZED SDK and its Python API before using "
++            "ZEDCamera."
++        ) from _PYZED_IMPORT_ERROR
++    return sl
++
++
++def _zed_resolutions() -> dict[str, Any]:
++    zed_sl = _require_pyzed()
++    resolutions = {
++        "HD2K": zed_sl.RESOLUTION.HD2K,
++        "HD1080": zed_sl.RESOLUTION.HD1080,
++        "HD720": zed_sl.RESOLUTION.HD720,
++        "VGA": zed_sl.RESOLUTION.VGA,
++    }
++    if hasattr(zed_sl.RESOLUTION, "HD1200"):
++        resolutions["HD1200"] = zed_sl.RESOLUTION.HD1200
++    if hasattr(zed_sl.RESOLUTION, "SVGA"):
++        resolutions["SVGA"] = zed_sl.RESOLUTION.SVGA
++    return resolutions
++
++
++class ZEDCamera(Camera):
++    """
++    Manages interactions with Stereolabs ZED cameras.
++
++    The camera is identified by serial number when provided. If no serial number
++    is specified, the ZED SDK selects the first available camera.
++    """
++
++    def __init__(self, config: ZEDCameraConfig):
++        super().__init__(config)
++        self.config = config
++        self.serial_number = config.serial_number
++
++        self.fps = config.fps
++        self.color_mode = config.color_mode
++        self.warmup_s = config.warmup_s
++
++        self.zed: Any | None = None
++
++        self.thread: Thread | None = None
++        self.stop_event: Event | None = None
++        self.frame_lock: Lock = Lock()
++        self.latest_color_frame: NDArray[Any] | None = None
++        self.latest_timestamp: float | None = None
++        self.new_frame_event: Event = Event()
++
++        self.rotation: int | None = get_cv2_rotation(config.rotation)
++        self.capture_width: int | None = self.width
++        self.capture_height: int | None = self.height
++
++        if self.height and self.width:
++            self.capture_width, self.capture_height = self.width, self.height
++            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
++                self.capture_width, self.capture_height = self.height, self.width
++
++    def __str__(self) -> str:
++        serial_number = self.serial_number or "auto"
++        return f"{self.__class__.__name__}({serial_number})"
++
++    @property
++    def is_connected(self) -> bool:
++        return self.zed is not None and self.zed.is_opened()
++
++    @check_if_already_connected
++    def connect(self, warmup: bool = True) -> None:
++        """
++        Connects to the configured ZED camera and starts a background read thread.
++        """
++        zed_sl = _require_pyzed()
++
++        init_params = zed_sl.InitParameters()
++        if self.serial_number is not None:
++            init_params.set_from_serial_number(int(self.serial_number))
++
++        if self.fps is not None:
++            init_params.camera_fps = self.fps
++        if self.capture_width is not None and self.capture_height is not None:
++            init_params.camera_resolution = self._find_resolution(self.capture_width, self.capture_height)
++
++        init_params.coordinate_units = zed_sl.UNIT.MILLIMETER
++        init_params.depth_mode = zed_sl.DEPTH_MODE.NONE
++
++        self.zed = zed_sl.Camera()
++        status = self.zed.open(init_params)
++        if status != zed_sl.ERROR_CODE.SUCCESS:
++            self.zed = None
++            raise ConnectionError(f"Failed to open {self}: {status}")
++
++        cam_info = self.zed.get_camera_information()
++        if self.serial_number is None:
++            self.serial_number = str(cam_info.serial_number)
++
++        calibration = cam_info.camera_configuration.calibration_parameters.left_cam
++        self.capture_width = calibration.image_size.width
++        self.capture_height = calibration.image_size.height
++        if self.width is None:
++            self.width = self.capture_width
++        if self.height is None:
++            self.height = self.capture_height
++        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
++            self.width, self.height = self.capture_height, self.capture_width
++        if self.fps is None:
++            self.fps = cam_info.camera_configuration.fps
++
++        self._start_read_thread()
++
++        if warmup and self.warmup_s > 0:
++            start_time = time.time()
++            while time.time() - start_time < self.warmup_s:
++                self.async_read(timeout_ms=self.warmup_s * 1000)
++                time.sleep(0.1)
++            with self.frame_lock:
++                if self.latest_color_frame is None:
++                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
++
++        logger.info(f"{self} connected. Resolution: {self.capture_width}x{self.capture_height} @ {self.fps}fps")
++
++    def _find_resolution(self, width: int, height: int) -> Any:
++        zed_sl = _require_pyzed()
++        best = None
++        best_wh = (0, 0)
++        for name, resolution in _zed_resolutions().items():
++            res_width, res_height = _RES_WH.get(name, (0, 0))
++            if res_width == width and res_height == height:
++                return resolution
++            if res_width >= width and res_height >= height:
++                if best is None or res_width * res_height < best_wh[0] * best_wh[1]:
++                    best = resolution
++                    best_wh = (res_width, res_height)
++        return best or zed_sl.RESOLUTION.HD720
++
++    @staticmethod
++    def find_cameras() -> list[dict[str, Any]]:
++        """
++        Detects available ZED cameras connected to the system.
++        """
++        zed_sl = _require_pyzed()
++        found_cameras_info = []
++        for device in zed_sl.Camera.get_device_list():
++            camera_info = {
++                "name": f"ZED Camera #{device.serial_number}",
++                "type": "ZED",
++                "id": str(device.serial_number),
++            }
++            if hasattr(device, "camera_model"):
++                camera_info["camera_model"] = str(device.camera_model)
++            if hasattr(device, "input_type"):
++                camera_info["input_type"] = str(device.input_type)
++            found_cameras_info.append(camera_info)
++        return found_cameras_info
++
++    @check_if_not_connected
++    def read(self) -> NDArray[Any]:
++        if self.thread is None or not self.thread.is_alive():
++            raise RuntimeError(f"{self} read thread is not running.")
++        self.new_frame_event.clear()
++        return self.async_read(timeout_ms=10000)
++
++    def _read_from_hardware(self) -> NDArray[Any]:
++        zed_sl = _require_pyzed()
++        if self.zed is None:
++            raise DeviceNotConnectedError(f"{self} not connected.")
++
++        runtime = zed_sl.RuntimeParameters()
++        if self.zed.grab(runtime) != zed_sl.ERROR_CODE.SUCCESS:
++            raise RuntimeError(f"{self} grab failed.")
++
++        mat = zed_sl.Mat()
++        self.zed.retrieve_image(mat, zed_sl.VIEW.LEFT)
++        return mat.get_data()
++
++    def _postprocess_image(self, image: NDArray[Any]) -> NDArray[Any]:
++        if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
++            raise ValueError(
++                f"Invalid color mode '{self.color_mode}'. Expected {ColorMode.RGB} or {ColorMode.BGR}."
++            )
++
++        if image.shape[2] == 4:
++            image = image[:, :, :3]
++
++        height, width, channels = image.shape
++        if height != self.capture_height or width != self.capture_width:
++            raise RuntimeError(
++                f"{self} frame width={width} or height={height} do not match configured "
++                f"width={self.capture_width} or height={self.capture_height}."
++            )
++        if channels != 3:
++            raise RuntimeError(f"{self} frame channels={channels} do not match expected 3 channels.")
++
++        processed_image = image
++        if self.color_mode == ColorMode.RGB:
++            processed_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
++
++        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
++            processed_image = cv2.rotate(processed_image, self.rotation)
++
++        return processed_image
++
++    def _read_loop(self) -> None:
++        if self.stop_event is None:
++            raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
++
++        failure_count = 0
++        while not self.stop_event.is_set():
++            try:
++                raw_frame = self._read_from_hardware()
++                processed_frame = self._postprocess_image(raw_frame)
++                capture_time = time.perf_counter()
++
++                with self.frame_lock:
++                    self.latest_color_frame = processed_frame
++                    self.latest_timestamp = capture_time
++                self.new_frame_event.set()
++                failure_count = 0
++            except DeviceNotConnectedError:
++                break
++            except Exception as e:
++                if failure_count <= 10:
++                    failure_count += 1
++                    logger.warning(f"Error reading frame in background thread for {self}: {e}")
++                else:
++                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
++
++    def _start_read_thread(self) -> None:
++        self._stop_read_thread()
++        self.stop_event = Event()
++        self.thread = Thread(target=self._read_loop, args=(), name=f"{self}_read_loop")
++        self.thread.daemon = True
++        self.thread.start()
++
++    def _stop_read_thread(self) -> None:
++        if self.stop_event is not None:
++            self.stop_event.set()
++
++        if self.thread is not None and self.thread.is_alive():
++            self.thread.join(timeout=2.0)
++
++        self.thread = None
++        self.stop_event = None
++
++        with self.frame_lock:
++            self.latest_color_frame = None
++            self.latest_timestamp = None
++            self.new_frame_event.clear()
++
++    @check_if_not_connected
++    def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
++        if self.thread is None or not self.thread.is_alive():
++            raise RuntimeError(f"{self} read thread is not running.")
++
++        if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
++            raise TimeoutError(
++                f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
++                f"Read thread alive: {self.thread.is_alive()}."
++            )
++
++        with self.frame_lock:
++            frame = self.latest_color_frame
++            self.new_frame_event.clear()
++        if frame is None:
++            raise RuntimeError(f"No frame available for camera {self}.")
++        return frame
++
++    @check_if_not_connected
++    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
++        if self.thread is None or not self.thread.is_alive():
++            raise RuntimeError(f"{self} read thread is not running.")
++
++        with self.frame_lock:
++            frame = self.latest_color_frame
++            timestamp = self.latest_timestamp
++
++        if frame is None or timestamp is None:
++            raise RuntimeError(f"{self} has not captured any frames yet.")
++
++        age_ms = (time.perf_counter() - timestamp) * 1e3
++        if age_ms > max_age_ms:
++            raise TimeoutError(f"{self} latest frame is too old: {age_ms:.1f} ms (max {max_age_ms} ms).")
++        return frame
++
++    def disconnect(self) -> None:
++        if not self.is_connected and self.thread is None:
++            raise DeviceNotConnectedError(f"{self} not connected.")
++
++        if self.thread is not None:
++            self._stop_read_thread()
++        if self.zed is not None:
++            self.zed.close()
++            self.zed = None
++
++        with self.frame_lock:
++            self.latest_color_frame = None
++            self.latest_timestamp = None
++            self.new_frame_event.clear()
++
++        logger.info(f"{self} disconnected.")
+diff --git a/src/lerobot/cameras/zed/configuration_zed.py b/src/lerobot/cameras/zed/configuration_zed.py
+new file mode 100644
+index 000000000..000000000
+--- /dev/null
++++ b/src/lerobot/cameras/zed/configuration_zed.py
+@@ -0,0 +1,43 @@
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from dataclasses import dataclass
++
++from ..configs import CameraConfig, ColorMode, Cv2Rotation
++
++
++@CameraConfig.register_subclass("zed")
++@CameraConfig.register_subclass("zed2")
++@dataclass
++class ZEDCameraConfig(CameraConfig):
++    """Configuration class for Stereolabs ZED cameras.
++
++    Attributes:
++        serial_number: Optional camera serial number. If omitted, the ZED SDK selects the first camera.
++        color_mode: Color mode for image output (RGB or BGR). Defaults to RGB.
++        rotation: Image rotation setting (0, 90, 180, or 270 degrees). Defaults to no rotation.
++        warmup_s: Time reading frames before returning from connect, in seconds.
++    """
++
++    serial_number: str | None = None
++    color_mode: ColorMode = ColorMode.RGB
++    rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
++    warmup_s: int = 1
++
++    def __post_init__(self) -> None:
++        self.color_mode = ColorMode(self.color_mode)
++        self.rotation = Cv2Rotation(self.rotation)
++
++        values = (self.fps, self.width, self.height)
++        if any(v is not None for v in values) and any(v is None for v in values):
++            raise ValueError(
++                "For `fps`, `width` and `height`, either all of them need to be set, or none of them."
++            )
+diff --git a/src/lerobot/cameras/utils.py b/src/lerobot/cameras/utils.py
+index 000000000..000000000 100644
+--- a/src/lerobot/cameras/utils.py
++++ b/src/lerobot/cameras/utils.py
+@@ -46,6 +46,11 @@ def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[s
+ 
+             cameras[key] = ZMQCamera(cfg)
+ 
++        elif cfg.type in ("zed", "zed2"):
++            from .zed.camera_zed import ZEDCamera
++
++            cameras[key] = ZEDCamera(cfg)
++
+         else:
+             try:
+                 cameras[key] = cast(Camera, make_device_from_device_class(cfg))
+diff --git a/src/lerobot/rl/actor.py b/src/lerobot/rl/actor.py
+index 000000000..000000000 100644
+--- a/src/lerobot/rl/actor.py
++++ b/src/lerobot/rl/actor.py
+@@ -48,6 +48,7 @@ import torch
+ from torch import nn
+ from torch.multiprocessing import Event, Queue
+ 
+ from lerobot.cameras import opencv  # noqa: F401
++from lerobot.cameras import zed  # noqa: F401
+ from lerobot.configs import parser
+ from lerobot.configs.train import TrainRLServerPipelineConfig
+ from lerobot.policies.factory import make_policy
+diff --git a/src/lerobot/rl/eval_policy.py b/src/lerobot/rl/eval_policy.py
+index 000000000..000000000 100644
+--- a/src/lerobot/rl/eval_policy.py
++++ b/src/lerobot/rl/eval_policy.py
+@@ -16,6 +16,7 @@
+ import logging
+ 
+ from lerobot.cameras import opencv  # noqa: F401
++from lerobot.cameras import zed  # noqa: F401
+ from lerobot.configs import parser
+ from lerobot.configs.train import TrainRLServerPipelineConfig
+ from lerobot.datasets.lerobot_dataset import LeRobotDataset
+diff --git a/src/lerobot/scripts/lerobot_calibrate.py b/src/lerobot/scripts/lerobot_calibrate.py
+index 000000000..000000000 100644
+--- a/src/lerobot/scripts/lerobot_calibrate.py
++++ b/src/lerobot/scripts/lerobot_calibrate.py
+@@ -33,6 +33,7 @@ import draccus
+ 
+ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
++from lerobot.cameras.zed.configuration_zed import ZEDCameraConfig  # noqa: F401
+ from lerobot.robots import (  # noqa: F401
+     Robot,
+     RobotConfig,
+diff --git a/src/lerobot/scripts/lerobot_find_cameras.py b/src/lerobot/scripts/lerobot_find_cameras.py
+index 000000000..000000000 100644
+--- a/src/lerobot/scripts/lerobot_find_cameras.py
++++ b/src/lerobot/scripts/lerobot_find_cameras.py
+@@ -42,6 +42,8 @@ from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
+ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+ from lerobot.cameras.realsense.camera_realsense import RealSenseCamera
+ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
++from lerobot.cameras.zed.camera_zed import ZEDCamera
++from lerobot.cameras.zed.configuration_zed import ZEDCameraConfig
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -88,12 +90,34 @@ def find_all_realsense_cameras() -> list[dict[str, Any]]:
+     return all_realsense_cameras_info
+ 
+ 
++def find_all_zed_cameras() -> list[dict[str, Any]]:
++    """
++    Finds all available ZED cameras plugged into the system.
++
++    Returns:
++        A list of all available ZED cameras with their metadata.
++    """
++    all_zed_cameras_info: list[dict[str, Any]] = []
++    logger.info("Searching for ZED cameras...")
++    try:
++        zed_cameras = ZEDCamera.find_cameras()
++        for cam_info in zed_cameras:
++            all_zed_cameras_info.append(cam_info)
++        logger.info(f"Found {len(zed_cameras)} ZED cameras.")
++    except ImportError:
++        logger.warning("Skipping ZED camera search: pyzed library not found or not importable.")
++    except Exception as e:
++        logger.error(f"Error finding ZED cameras: {e}")
++
++    return all_zed_cameras_info
++
++
+ def find_and_print_cameras(camera_type_filter: str | None = None) -> list[dict[str, Any]]:
+     """
+     Finds available cameras based on an optional filter and prints their information.
+ 
+     Args:
+-        camera_type_filter: Optional string to filter cameras ("realsense" or "opencv").
++        camera_type_filter: Optional string to filter cameras ("realsense", "opencv", or "zed").
+                             If None, lists all cameras.
+ 
+     Returns:
+@@ -109,12 +135,14 @@ def find_and_print_cameras(camera_type_filter: str | None = None) -> list[dict[s
+         all_cameras_info.extend(find_all_opencv_cameras())
+     if camera_type_filter is None or camera_type_filter == "realsense":
+         all_cameras_info.extend(find_all_realsense_cameras())
++    if camera_type_filter is None or camera_type_filter == "zed":
++        all_cameras_info.extend(find_all_zed_cameras())
+ 
+     if not all_cameras_info:
+         if camera_type_filter:
+             logger.warning(f"No {camera_type_filter} cameras were detected.")
+         else:
+-            logger.warning("No cameras (OpenCV or RealSense) were detected.")
++            logger.warning("No cameras (OpenCV, RealSense, or ZED) were detected.")
+     else:
+         print("\n--- Detected Cameras ---")
+         for i, cam_info in enumerate(all_cameras_info):
+@@ -176,6 +204,12 @@ def create_camera_instance(cam_meta: dict[str, Any]) -> dict[str, Any] | None:
+                 color_mode=ColorMode.RGB,
+             )
+             instance = RealSenseCamera(rs_config)
++        elif cam_type == "ZED":
++            zed_config = ZEDCameraConfig(
++                serial_number=cam_id,
++                color_mode=ColorMode.RGB,
++            )
++            instance = ZEDCamera(zed_config)
+         else:
+             logger.warning(f"Unknown camera type: {cam_type} for ID {cam_id}. Skipping.")
+             return None
+@@ -239,7 +273,7 @@ def save_images_from_all_cameras(
+         output_dir: Directory to save images.
+         record_time_s: Duration in seconds to record images.
+         camera_type: Optional string to filter cameras ("realsense" or "opencv").
+-                            If None, uses all detected cameras.
++                     If None, uses all detected cameras.
+     """
+     output_dir.mkdir(parents=True, exist_ok=True)
+     logger.info(f"Saving images to {output_dir}")
+@@ -298,8 +332,8 @@ def main():
+         type=str,
+         nargs="?",
+         default=None,
+-        choices=["realsense", "opencv"],
+-        help="Specify camera type to capture from (e.g., 'realsense', 'opencv'). Captures from all if omitted.",
++        choices=["realsense", "opencv", "zed"],
++        help="Specify camera type to capture from (e.g., 'realsense', 'opencv', 'zed'). Captures from all if omitted.",
+     )
+     parser.add_argument(
+         "--output-dir",
+diff --git a/src/lerobot/scripts/lerobot_record.py b/src/lerobot/scripts/lerobot_record.py
+index 000000000..000000000 100644
+--- a/src/lerobot/scripts/lerobot_record.py
++++ b/src/lerobot/scripts/lerobot_record.py
+@@ -82,6 +82,7 @@ from lerobot.cameras import (  # noqa: F401
+ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+ from lerobot.cameras.reachy2_camera.configuration_reachy2_camera import Reachy2CameraConfig  # noqa: F401
+ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
++from lerobot.cameras.zed.configuration_zed import ZEDCameraConfig  # noqa: F401
+ from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
+ from lerobot.configs import parser
+ from lerobot.configs.policies import PreTrainedConfig
+diff --git a/src/lerobot/scripts/lerobot_teleoperate.py b/src/lerobot/scripts/lerobot_teleoperate.py
+index 000000000..000000000 100644
+--- a/src/lerobot/scripts/lerobot_teleoperate.py
++++ b/src/lerobot/scripts/lerobot_teleoperate.py
+@@ -61,6 +61,7 @@ import rerun as rr
+ 
+ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
++from lerobot.cameras.zed.configuration_zed import ZEDCameraConfig  # noqa: F401
+ from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
+ from lerobot.configs import parser
+ from lerobot.processor import (

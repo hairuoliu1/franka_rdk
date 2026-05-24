@@ -37,8 +37,6 @@ workspace/
 └── lerobot/                             # LeRobot 框架 (git submodule)
 ```
 
-> **lerobot 为 git submodule**，指向上游 [huggingface/lerobot](https://github.com/huggingface/lerobot)。当前仓库直接按子模块指针使用，不再需要额外应用本地 patch。
-
 ---
 
 ## Git 仓库与子模块管理
@@ -56,17 +54,7 @@ git submodule update --init
 ```bash
 git submodule update --init --recursive lerobot
 cd lerobot
-```
-
-如果需要升级 LeRobot，先在子模块内切换到目标 commit，再回到主仓库提交子模块指针：
-
-```bash
-cd lerobot
-git fetch
-git checkout <target-commit-or-tag>
-cd ..
-git add lerobot
-git commit -m "update lerobot submodule"
+git apply ../zed_camera.patch
 ```
 
 ---
