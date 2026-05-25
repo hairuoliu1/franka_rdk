@@ -16,19 +16,21 @@
   joint_impedance_controller:
     ros__parameters:
       k_alpha: 0.99
+      # Conservative contact tuning: reduce stiffness in small steps instead of
+      # making the arm overly compliant or sluggish.
       k_gains:
-        - 240.0
-        - 240.0
-        - 240.0
-        - 240.0
-        - 100.0
-        - 60.0
-        - 20.0
+        - 220.0
+        - 220.0
+        - 220.0
+        - 220.0
+        - 92.0
+        - 58.0
+        - 19.0
       d_gains:
-        - 20.0
-        - 20.0
-        - 20.0
-        - 10.0
-        - 10.0
-        - 10.0
-        - 5.0
+        - 19.0
+        - 19.0
+        - 19.0
+        - 9.5
+        - 9.5
+        - 9.0
+        - 4.75

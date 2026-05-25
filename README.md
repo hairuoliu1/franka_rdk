@@ -213,7 +213,7 @@ ros2 topic list | grep -E "cam1|cam2|color/image"
 
 ### 步骤 5：启动 GELLO 状态发布器
 
-> **必须先启动 GELLO，再启动 Franka 控制器。** 否则 joint_impedance_controller 收不到有效的关节状态，机械臂会因目标位置跳变触发 reflex 保护 (power_limit_violation / joint_velocity_violation)。
+> **必须先启动 GELLO，再启动 Franka 控制器。** 启动前确认关节状态正常发布，避免控制器在没有有效目标时进入保护状态。
 
 ```bash
 ros2 launch franka_gello_state_publisher main.launch.py \
@@ -258,6 +258,36 @@ ros2 run tf2_ros tf2_echo fr3_link0 fr3_link8
 # - Translation: [0.307, 0.000, 0.590]
 # - Rotation: in RPY (degree) [-180.000, 0.000, -45.000]
 ```
+
+#### 接触保护与阻抗调参
+
+`cartesian_reflex` 是 Franka 的笛卡尔力/力矩反射保护。不要只把碰撞阈值大幅调高；这同时关系到用户碰撞保护和机械臂自身保护。当前策略是：
+
+- 碰撞阈值只适度提高，让正常轻微接触不马上停机。
+- 关节阻抗刚度小步降低，让接触更温和。
+- 不一次性把刚度调得很低，否则遥操作会明显变慢、变软，也会降低可控性。
+
+当前 `joint_impedance_controller` 的刚度已做保守下调：
+
+```yaml
+k_gains: [220.0, 220.0, 220.0, 220.0, 92.0, 58.0, 19.0]
+d_gains: [19.0, 19.0, 19.0, 9.5, 9.5, 9.0, 4.75]
+```
+
+启动 Franka 控制器后，可以设置适度提高后的碰撞阈值：
+
+```bash
+ros2 run franka_fr3_arm_controllers set_collision_behavior.py left right
+```
+
+默认阈值为：
+
+```yaml
+lower_force_thresholds: [34.0, 34.0, 34.0, 28.0, 28.0, 28.0]
+upper_force_thresholds: [45.0, 45.0, 45.0, 38.0, 38.0, 38.0]
+```
+
+这里 `lower_*` 表示接触提示，`upper_*` 表示真正触发 collision/reflex 停机。继续调参时按小步推进，例如每次只把线性 force 的 `upper_force_thresholds` 提高 5 N，或把 `k_gains` 再降低 10% 左右。不要直接把 force 阈值拉到很高。
 
 移动到预设起始位置：
 

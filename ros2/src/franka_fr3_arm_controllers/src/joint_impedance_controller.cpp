@@ -60,22 +60,19 @@ controller_interface::return_type JointImpedanceController::update(
     // After starting the controller we wait for valid joint states from the input topic
     // Until we get valid joint states we will hold the current position
     motion_generator_initialized_ = initializeMotionGenerator_();
-
-    static bool hold_initialized = false;
-    static Vector7d q_hold;
     if (!motion_generator_initialized_) {
-      if (!hold_initialized) {
-        q_hold = q_;
-        hold_initialized = true;
+      if (!hold_position_logged_) {
+        q_hold_ = q_;
+        hold_position_logged_ = true;
         RCLCPP_INFO(get_node()->get_logger(), "Position hold active until GELLO connects.");
       }
-      tau_d_calculated = calculateTauDGains_(q_hold);
+      tau_d_calculated = calculateTauDGains_(q_hold_);
       for (int i = 0; i < num_joints; ++i) {
         command_interfaces_[i].set_value(tau_d_calculated(i));
       }
       return controller_interface::return_type::OK;
     }
-    hold_initialized = false;
+    hold_position_logged_ = false;
   }
 
   if (!move_to_start_position_finished_) {
@@ -93,9 +90,14 @@ controller_interface::return_type JointImpedanceController::update(
     // This is the normal operation mode of the controller
     // 取消了自动shutdown，改为当gello位置值无效时发送警告并继续使用最后一个有效的gello位置值
     if (!gello_position_values_valid_) {
-      RCLCPP_WARN(get_node()->get_logger(),
-                  "Gello timeout: using new position after %.1fs gap.",
-                  (this->get_node()->now() - last_joint_state_time_).seconds());
+      if (!gello_timeout_logged_) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "Gello timeout: keeping last valid position after %.1fs gap.",
+                    (this->get_node()->now() - last_joint_state_time_).seconds());
+        gello_timeout_logged_ = true;
+      }
+    } else {
+      gello_timeout_logged_ = false;
     }
     for (int i = 0; i < num_joints; ++i) {
       q_goal(i) = gello_position_values_[i];

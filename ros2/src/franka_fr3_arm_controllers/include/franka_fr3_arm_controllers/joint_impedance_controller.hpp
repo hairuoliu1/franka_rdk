@@ -54,11 +54,13 @@ class JointImpedanceController : public controller_interface::ControllerInterfac
   double k_alpha_;
   bool move_to_start_position_finished_{false};
   bool motion_generator_initialized_{false};
+  bool hold_position_logged_{false};
+  bool gello_timeout_logged_{false};
   rclcpp::Time start_time_;
   std::unique_ptr<MotionGenerator> motion_generator_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscriber_ = nullptr;
   bool gello_position_values_valid_ = false;
-  //std::array<double, 7> gello_position_values_{0, 0, 0, 0, 0, 0, 0}; 没卵用
+  Vector7d q_hold_;
   std::array<double, 7> gello_position_values_{0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785};
   rclcpp::Time last_joint_state_time_;
 
