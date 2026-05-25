@@ -228,13 +228,22 @@ ros2 topic echo /right/gello/joint_states
 # 确认关节值在正常范围内 (不应出现 ±2.9007 等极限值)
 ```
 
+如果 Franka controller 持续打印 `Waiting for valid joint states...`，说明
+`joint_impedance_controller` 没有订阅到 GELLO 关节话题。双臂配置下它应该分别订阅
+`/left/gello/joint_states` 和 `/right/gello/joint_states`，启动日志中应看到：
+
+```text
+Subscribing to GELLO joint states on '/left/gello/joint_states'.
+Subscribing to GELLO joint states on '/right/gello/joint_states'.
+```
+
 ### 步骤 6：启动 Franka 机械臂
 
 > 确认 GELLO 正常发布后，再启动此步骤。
 
 ```bash
 ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
-    robot_config_file:=configs/fr3_config.yaml
+    robot_config_file:=/workspace/configs/fr3_config.yaml
 ```
 
 启动后的话题列表：
@@ -584,7 +593,7 @@ ros2 launch franka_gello_state_publisher main.launch.py \
 
 # ===== 终端 2: 关节阻抗控制器 =====
 ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
-    robot_config_file:=configs/fr3_config.yaml
+    robot_config_file:=/workspace/configs/fr3_config.yaml
 
 # ===== 终端 3: Robotiq 夹爪 =====
 ros2 launch franka_gripper_manager robotiq_gripper_controller_client.launch.py \

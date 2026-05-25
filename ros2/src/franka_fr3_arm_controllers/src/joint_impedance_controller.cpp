@@ -134,6 +134,7 @@ void JointImpedanceController::jointStateCallback_(const sensor_msgs::msg::Joint
 CallbackReturn JointImpedanceController::on_init() {
   try {
     auto_declare<std::string>("arm_id", "");
+    auto_declare<std::string>("gello_joint_states_topic", "gello/joint_states");
     auto_declare<std::vector<double>>("k_gains", {});
     auto_declare<std::vector<double>>("d_gains", {});
   } catch (const std::exception& e) {
@@ -157,6 +158,7 @@ CallbackReturn JointImpedanceController::on_configure(
   auto k_gains = get_node()->get_parameter("k_gains").as_double_array();
   auto d_gains = get_node()->get_parameter("d_gains").as_double_array();
   auto k_alpha = get_node()->get_parameter("k_alpha").as_double();
+  gello_joint_states_topic_ = get_node()->get_parameter("gello_joint_states_topic").as_string();
 
   if (!validateGains_(k_gains, "k_gains") || !validateGains_(d_gains, "d_gains")) {
     return CallbackReturn::FAILURE;
@@ -188,8 +190,12 @@ CallbackReturn JointImpedanceController::on_configure(
     RCLCPP_ERROR(get_node()->get_logger(), "Failed to get robot_description parameter.");
   }
 
+  const auto resolved_gello_topic =
+      get_node()->get_node_topics_interface()->resolve_topic_name(gello_joint_states_topic_);
+  RCLCPP_INFO(get_node()->get_logger(), "Subscribing to GELLO joint states on '%s'.",
+              resolved_gello_topic.c_str());
   joint_state_subscriber_ = get_node()->create_subscription<sensor_msgs::msg::JointState>(
-      "gello/joint_states", 1,
+      gello_joint_states_topic_, 1,
       [this](const sensor_msgs::msg::JointState& msg) { jointStateCallback_(msg); });
 
   return CallbackReturn::SUCCESS;

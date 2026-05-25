@@ -45,6 +45,7 @@ class JointImpedanceController : public controller_interface::ControllerInterfac
   std::string arm_id_;
   std::string namespace_prefix_;
   std::string robot_description_;
+  std::string gello_joint_states_topic_;
   const int num_joints = 7;
   Vector7d q_;
   Vector7d dq_;

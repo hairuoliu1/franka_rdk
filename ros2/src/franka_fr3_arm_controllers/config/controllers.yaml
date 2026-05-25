@@ -16,6 +16,7 @@
   joint_impedance_controller:
     ros__parameters:
       k_alpha: 0.99
+      gello_joint_states_topic: gello/joint_states
       # Conservative contact tuning: reduce stiffness in small steps instead of
       # making the arm overly compliant or sluggish.
       k_gains:
