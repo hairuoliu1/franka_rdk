@@ -54,6 +54,775 @@ index 7fb2c3bb..c0c3add2 100644
          else:
              try:
                  cameras[key] = cast(Camera, make_device_from_device_class(cfg))
+diff --git a/src/lerobot/cameras/zed/__init__.py b/src/lerobot/cameras/zed/__init__.py
+new file mode 100644
+index 00000000..a4cd9d47
+--- /dev/null
++++ b/src/lerobot/cameras/zed/__init__.py
+@@ -0,0 +1,6 @@
++#!/usr/bin/env python
++
++from .camera_zed import ZEDCamera
++from .configuration_zed import ZEDCameraConfig
++
++__all__ = ["ZEDCamera", "ZEDCameraConfig"]
+diff --git a/src/lerobot/cameras/zed/camera_zed.py b/src/lerobot/cameras/zed/camera_zed.py
+new file mode 100644
+index 00000000..296452b4
+--- /dev/null
++++ b/src/lerobot/cameras/zed/camera_zed.py
+@@ -0,0 +1,278 @@
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import time
++from threading import Event, Lock, Thread
++from typing import Any
++
++import cv2  # type: ignore
++import numpy as np  # type: ignore
++from numpy.typing import NDArray  # type: ignore
++
++from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
++from lerobot.utils.errors import DeviceNotConnectedError
++
++from ..camera import Camera
++from ..configs import ColorMode
++from ..utils import get_cv2_rotation
++from .configuration_zed import ZEDCameraConfig
++
++logger = logging.getLogger(__name__)
++
++try:
++    import pyzed.sl as sl  # type: ignore
++except Exception as e:
++    sl = None
++    _PYZED_IMPORT_ERROR = e
++else:
++    _PYZED_IMPORT_ERROR = None
++
++
++def _require_pyzed() -> None:
++    if sl is None:
++        raise ImportError(
++            "pyzed is not available. Install ZED SDK Python bindings before using ZED cameras."
++        ) from _PYZED_IMPORT_ERROR
++
++
++def _sl_resolution(width: int | None, height: int | None):
++    if width is None or height is None:
++        return None
++    presets = {
++        (2208, 1242): sl.RESOLUTION.HD2K,
++        (1920, 1080): sl.RESOLUTION.HD1080,
++        (1280, 720): sl.RESOLUTION.HD720,
++        (672, 376): sl.RESOLUTION.VGA,
++    }
++    return presets.get((width, height))
++
++
++class ZEDCamera(Camera):
++    """ZED camera wrapper with the same interface as other LeRobot cameras."""
++
++    def __init__(self, config: ZEDCameraConfig):
++        super().__init__(config)
++
++        _require_pyzed()
++
++        self.config = config
++        self.serial_number = None if config.serial_number is None else int(config.serial_number)
++        self.camera_model = config.camera_model
++        self.color_mode = config.color_mode
++        self.warmup_s = config.warmup_s
++        self.rotation = get_cv2_rotation(config.rotation)
++
++        self.zed: sl.Camera | None = None
++        self.runtime_params: sl.RuntimeParameters | None = None
++        self.image_mat: sl.Mat | None = None
++
++        self.thread: Thread | None = None
++        self.stop_event: Event | None = None
++        self.frame_lock: Lock = Lock()
++        self.latest_frame: NDArray[Any] | None = None
++        self.latest_timestamp: float | None = None
++        self.new_frame_event: Event = Event()
++
++        if self.height and self.width:
++            self.capture_width, self.capture_height = self.width, self.height
++            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
++                self.capture_width, self.capture_height = self.height, self.width
++
++    def __str__(self) -> str:
++        identifier = self.serial_number if self.serial_number is not None else "default"
++        return f"{self.__class__.__name__}({identifier})"
++
++    @property
++    def is_connected(self) -> bool:
++        return self.zed is not None
++
++    @staticmethod
++    def find_cameras() -> list[dict[str, Any]]:
++        _require_pyzed()
++
++        found: list[dict[str, Any]] = []
++        for device in sl.Camera.get_device_list():
++            found.append(
++                {
++                    "type": "ZED",
++                    "id": str(device.serial_number),
++                    "name": str(device.camera_model),
++                    "serial_number": str(device.serial_number),
++                    "camera_model": str(device.camera_model),
++                    "input_type": str(device.input_type),
++                }
++            )
++        return found
++
++    @check_if_already_connected
++    def connect(self, warmup: bool = True) -> None:
++        _require_pyzed()
++
++        init_params = sl.InitParameters()
++        resolution = _sl_resolution(self.width, self.height)
++        if resolution is not None:
++            init_params.camera_resolution = resolution
++        if self.fps is not None:
++            init_params.camera_fps = int(self.fps)
++        if self.serial_number is not None:
++            init_params.set_from_serial_number(self.serial_number)
++
++        camera = sl.Camera()
++        status = camera.open(init_params)
++        if status != sl.ERROR_CODE.SUCCESS:
++            raise ConnectionError(f"Failed to open {self}: {status}")
++
++        info = camera.get_camera_information()
++        resolution_obj = info.camera_configuration.resolution
++        actual_width = int(resolution_obj.width)
++        actual_height = int(resolution_obj.height)
++        actual_fps = int(info.camera_configuration.fps)
++
++        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
++            self.width, self.height = actual_height, actual_width
++            self.capture_width, self.capture_height = actual_width, actual_height
++        else:
++            self.width, self.height = actual_width, actual_height
++            self.capture_width, self.capture_height = actual_width, actual_height
++        self.fps = actual_fps
++
++        self.zed = camera
++        self.runtime_params = sl.RuntimeParameters()
++        self.image_mat = sl.Mat(actual_width, actual_height, sl.MAT_TYPE.U8_C4)
++        self._start_read_thread()
++
++        if warmup and self.warmup_s > 0:
++            start_time = time.time()
++            while time.time() - start_time < self.warmup_s:
++                self.async_read(timeout_ms=max(int(self.warmup_s * 1000), 1000))
++                time.sleep(0.1)
++            with self.frame_lock:
++                if self.latest_frame is None:
++                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
++
++        logger.info("%s connected.", self)
++
++    def _postprocess_image(self, image: NDArray[Any]) -> NDArray[Any]:
++        if image.ndim != 3 or image.shape[2] < 3:
++            raise RuntimeError(f"Unexpected ZED image shape: {image.shape}")
++
++        # ZED returns U8_C4 images in BGRA order. Normalize to either RGB or BGR
++        # so downstream dataset/video code sees the same channel contract as the
++        # other camera backends.
++        if image.shape[2] == 4:
++            if self.color_mode == ColorMode.BGR:
++                image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
++            else:
++                image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
++        else:
++            if self.color_mode == ColorMode.BGR:
++                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
++            else:
++                image = image[:, :, :3]
++
++        if self.rotation is not None:
++            image = cv2.rotate(image, self.rotation)
++
++        return image
++
++    def _read_from_hardware(self) -> NDArray[Any]:
++        if self.zed is None or self.runtime_params is None or self.image_mat is None:
++            raise DeviceNotConnectedError(f"{self} is not connected.")
++
++        status = self.zed.grab(self.runtime_params)
++        if status != sl.ERROR_CODE.SUCCESS:
++            raise RuntimeError(f"{self} grab failed: {status}")
++
++        self.zed.retrieve_image(self.image_mat, sl.VIEW.LEFT)
++        frame = self.image_mat.get_data()
++        if frame is None:
++            raise RuntimeError(f"{self} returned no image data.")
++        return self._postprocess_image(np.array(frame, copy=True))
++
++    def _read_loop(self) -> None:
++        assert self.stop_event is not None
++        while not self.stop_event.is_set():
++            try:
++                frame = self._read_from_hardware()
++                with self.frame_lock:
++                    self.latest_frame = frame
++                    self.latest_timestamp = time.perf_counter()
++                    self.new_frame_event.set()
++            except Exception as e:
++                logger.debug("%s background read failed: %s", self, e)
++                time.sleep(0.05)
++
++    def _start_read_thread(self) -> None:
++        self.stop_event = Event()
++        self.new_frame_event.clear()
++        self.thread = Thread(target=self._read_loop, name=f"zed_camera_{self.serial_number}", daemon=True)
++        self.thread.start()
++
++    @check_if_not_connected
++    def read(self) -> NDArray[Any]:
++        start_time = time.perf_counter()
++        self.new_frame_event.clear()
++        frame = self.async_read(timeout_ms=10000)
++        logger.debug("%s read took %.1fms", self, (time.perf_counter() - start_time) * 1e3)
++        return frame
++
++    @check_if_not_connected
++    def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
++        if self.thread is None or not self.thread.is_alive():
++            raise RuntimeError(f"{self} read thread is not running.")
++
++        if not self.new_frame_event.wait(timeout=timeout_ms / 1000):
++            raise TimeoutError(f"Timed out waiting for a new frame from {self}.")
++
++        with self.frame_lock:
++            frame = self.latest_frame
++            self.new_frame_event.clear()
++
++        if frame is None:
++            raise RuntimeError(f"{self} has no frame available.")
++        return frame
++
++    @check_if_not_connected
++    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
++        with self.frame_lock:
++            frame = self.latest_frame
++            timestamp = self.latest_timestamp
++
++        if frame is None or timestamp is None:
++            raise RuntimeError(f"{self} has not captured any frame yet.")
++        age_ms = (time.perf_counter() - timestamp) * 1000
++        if age_ms > max_age_ms:
++            raise TimeoutError(f"Latest frame from {self} is stale ({age_ms:.1f}ms > {max_age_ms}ms).")
++        return frame
++
++    def disconnect(self) -> None:
++        if not self.is_connected:
++            return
++
++        if self.stop_event is not None:
++            self.stop_event.set()
++        if self.thread is not None:
++            self.thread.join(timeout=1.0)
++        self.thread = None
++        self.stop_event = None
++        self.new_frame_event.clear()
++
++        if self.zed is not None:
++            self.zed.close()
++        self.zed = None
++        self.runtime_params = None
++        self.image_mat = None
++        self.latest_frame = None
++        self.latest_timestamp = None
+diff --git a/src/lerobot/cameras/zed/configuration_zed.py b/src/lerobot/cameras/zed/configuration_zed.py
+new file mode 100644
+index 00000000..0ce6fa6f
+--- /dev/null
++++ b/src/lerobot/cameras/zed/configuration_zed.py
+@@ -0,0 +1,40 @@
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from dataclasses import dataclass
++
++from ..configs import CameraConfig, ColorMode, Cv2Rotation
++
++
++@CameraConfig.register_subclass("zed")
++@CameraConfig.register_subclass("zed2")
++@dataclass
++class ZEDCameraConfig(CameraConfig):
++    """Configuration for Stereolabs ZED cameras."""
++
++    serial_number: str | int | None = None
++    camera_model: str | None = None
++    color_mode: ColorMode = ColorMode.RGB
++    rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
++    warmup_s: int = 1
++
++    def __post_init__(self) -> None:
++        self.color_mode = ColorMode(self.color_mode)
++        self.rotation = Cv2Rotation(self.rotation)
++
++        values = (self.fps, self.width, self.height)
++        if any(v is not None for v in values) and any(v is None for v in values):
++            raise ValueError(
++                "For `fps`, `width` and `height`, either all of them need to be set, or none of them."
++            )
+diff --git a/src/lerobot/franka_rdk/__init__.py b/src/lerobot/franka_rdk/__init__.py
+new file mode 100644
+index 00000000..7fb0fb3e
+--- /dev/null
++++ b/src/lerobot/franka_rdk/__init__.py
+@@ -0,0 +1,6 @@
++#!/usr/bin/env python
++
++from .camera_config import default_left_arm_cameras, default_right_arm_cameras, load_camera_layout
++from .register import register
++
++__all__ = ["register", "load_camera_layout", "default_left_arm_cameras", "default_right_arm_cameras"]
+diff --git a/src/lerobot/franka_rdk/camera_config.py b/src/lerobot/franka_rdk/camera_config.py
+new file mode 100644
+index 00000000..ca126784
+--- /dev/null
++++ b/src/lerobot/franka_rdk/camera_config.py
+@@ -0,0 +1,44 @@
++from __future__ import annotations
++
++from copy import deepcopy
++from dataclasses import dataclass, field
++from functools import lru_cache
++
++import draccus
++
++from lerobot.cameras import CameraConfig
++from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
++from lerobot.cameras.zed.configuration_zed import ZEDCameraConfig  # noqa: F401
++
++from .paths import camera_yaml_path
++
++__all__ = [
++    "FrankaCameraLayoutConfig",
++    "default_left_arm_cameras",
++    "default_right_arm_cameras",
++    "load_camera_layout",
++]
++
++
++@dataclass
++class FrankaCameraLayoutConfig:
++    left_arm: dict[str, CameraConfig] = field(default_factory=dict)
++    right_arm: dict[str, CameraConfig] = field(default_factory=dict)
++
++
++@lru_cache(maxsize=1)
++def _load_camera_layout() -> FrankaCameraLayoutConfig:
++    with camera_yaml_path().open("r", encoding="utf-8") as f:
++        return draccus.load(FrankaCameraLayoutConfig, f)
++
++
++def load_camera_layout() -> FrankaCameraLayoutConfig:
++    return deepcopy(_load_camera_layout())
++
++
++def default_left_arm_cameras() -> dict[str, CameraConfig]:
++    return deepcopy(_load_camera_layout().left_arm)
++
++
++def default_right_arm_cameras() -> dict[str, CameraConfig]:
++    return deepcopy(_load_camera_layout().right_arm)
+diff --git a/src/lerobot/franka_rdk/paths.py b/src/lerobot/franka_rdk/paths.py
+new file mode 100644
+index 00000000..ce7a846d
+--- /dev/null
++++ b/src/lerobot/franka_rdk/paths.py
+@@ -0,0 +1,36 @@
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++_ROOT_ENV_VARS = ("LEROBOT_FRANKA_RDK_ROOT", "FRANKA_RDK_ROOT")
++
++
++def _candidate_roots() -> list[Path]:
++    candidates: list[Path] = []
++    for env_name in _ROOT_ENV_VARS:
++        raw_value = os.environ.get(env_name)
++        if raw_value:
++            candidates.append(Path(raw_value).expanduser().resolve())
++    candidates.extend([Path(__file__).resolve(), Path.cwd().resolve()])
++    return candidates
++
++
++def find_repo_root() -> Path:
++    for candidate in _candidate_roots():
++        for parent in [candidate, *candidate.parents]:
++            if (parent / "configs" / "camera.yaml").is_file():
++                return parent
++
++    env_hint = " or ".join(f"${name}" for name in _ROOT_ENV_VARS)
++    raise FileNotFoundError(
++        "Could not locate Franka RDK repository root. "
++        f"Set {env_hint} or keep configs/camera.yaml alongside the repository root."
++    )
++
++
++def camera_yaml_path() -> Path:
++    path = find_repo_root() / "configs" / "camera.yaml"
++    if not path.is_file():
++        raise FileNotFoundError(f"Missing camera config file: {path}")
++    return path
+diff --git a/src/lerobot/franka_rdk/register.py b/src/lerobot/franka_rdk/register.py
+new file mode 100644
+index 00000000..2711bef3
+--- /dev/null
++++ b/src/lerobot/franka_rdk/register.py
+@@ -0,0 +1,35 @@
++import importlib
++import logging
++
++logger = logging.getLogger(__name__)
++
++PLUGIN_MODULES = (
++    "lerobot.robots.franka_fr3_robotiq_gripper",
++    "lerobot.robots.bi_franka_fr3_robotiq_gripper",
++    "lerobot.teleoperators.gello_leader",
++    "lerobot.teleoperators.bi_gello_leader",
++)
++
++OPTIONAL_PLUGIN_MODULES = (
++    "lerobot.policies.openpi_client",
++    "lerobot.cameras.zed",
++)
++
++_REGISTERED = False
++
++
++def register() -> None:
++    global _REGISTERED
++    if _REGISTERED:
++        return
++
++    for module_name in PLUGIN_MODULES:
++        importlib.import_module(module_name)
++
++    for module_name in OPTIONAL_PLUGIN_MODULES:
++        try:
++            importlib.import_module(module_name)
++        except Exception as exc:
++            logger.warning("Could not import optional Franka RDK plugin %s: %s", module_name, exc)
++
++    _REGISTERED = True
+diff --git a/src/lerobot/policies/openpi_client/__init__.py b/src/lerobot/policies/openpi_client/__init__.py
+new file mode 100644
+index 00000000..ae79c04b
+--- /dev/null
++++ b/src/lerobot/policies/openpi_client/__init__.py
+@@ -0,0 +1,7 @@
++#!/usr/bin/env python
++
++from .configuration_openpi_client import OpenPIClientConfig
++from .modeling_openpi_client import OpenPIClientPolicy
++from .processor_openpi_client import make_openpi_client_pre_post_processors
++
++__all__ = ["OpenPIClientConfig", "OpenPIClientPolicy", "make_openpi_client_pre_post_processors"]
+diff --git a/src/lerobot/policies/openpi_client/configuration_openpi_client.py b/src/lerobot/policies/openpi_client/configuration_openpi_client.py
+new file mode 100644
+index 00000000..2e6210d5
+--- /dev/null
++++ b/src/lerobot/policies/openpi_client/configuration_openpi_client.py
+@@ -0,0 +1,36 @@
++from dataclasses import dataclass
++
++from lerobot.configs.policies import PreTrainedConfig
++from lerobot.optim.optimizers import AdamConfig
++from lerobot.optim.schedulers import DiffuserSchedulerConfig
++
++
++@PreTrainedConfig.register_subclass("openpi_client")
++@dataclass
++class OpenPIClientConfig(PreTrainedConfig):
++    n_obs_steps: int = 1
++    horizon: int = 50
++    n_action_steps: int = 25
++    host: str = "http://127.0.0.1:8000"
++    default_prompt: str = ""
++
++    @property
++    def observation_delta_indices(self) -> list:
++        return list(range(1 - self.n_obs_steps, 1))
++
++    @property
++    def action_delta_indices(self) -> list:
++        return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon))
++
++    @property
++    def reward_delta_indices(self) -> None:
++        return None
++
++    def get_optimizer_preset(self) -> AdamConfig | None:
++        return None
++
++    def get_scheduler_preset(self) -> DiffuserSchedulerConfig | None:
++        return None
++
++    def validate_features(self) -> None:
++        return
+diff --git a/src/lerobot/policies/openpi_client/modeling_openpi_client.py b/src/lerobot/policies/openpi_client/modeling_openpi_client.py
+new file mode 100644
+index 00000000..be711016
+--- /dev/null
++++ b/src/lerobot/policies/openpi_client/modeling_openpi_client.py
+@@ -0,0 +1,108 @@
++from typing import Any
++
++import msgpack
++import numpy as np
++import requests
++import torch
++from torch import Tensor
++from torch.nn import Linear
++
++from lerobot.policies.pretrained import PreTrainedPolicy
++
++from .configuration_openpi_client import OpenPIClientConfig
++from .processor_openpi_client import OpenPIDataProcessor
++
++
++def _pack_array(obj: Any):
++    if isinstance(obj, (np.ndarray, np.generic)) and getattr(obj, "dtype", None) is not None:
++        if obj.dtype.kind in ("V", "O", "c"):
++            raise ValueError(f"Unsupported dtype: {obj.dtype}")
++    if isinstance(obj, np.ndarray):
++        return {b"__ndarray__": True, b"data": obj.tobytes(), b"dtype": obj.dtype.str, b"shape": obj.shape}
++    if isinstance(obj, np.generic):
++        return {b"__npgeneric__": True, b"data": obj.item(), b"dtype": obj.dtype.str}
++    return obj
++
++
++def _unpack_array(obj: dict):
++    if b"__ndarray__" in obj:
++        return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]), shape=obj[b"shape"])
++    if b"__npgeneric__" in obj:
++        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
++    return obj
++
++
++def packb(data: Any) -> bytes:
++    return msgpack.packb(data, default=_pack_array, use_bin_type=True)
++
++
++def unpackb(data: bytes) -> Any:
++    return msgpack.unpackb(data, object_hook=_unpack_array, raw=False)
++
++
++class OpenPIClientPolicy(PreTrainedPolicy):
++    config_class = OpenPIClientConfig
++    name = "openpi_client"
++
++    def __init__(self, config: OpenPIClientConfig):
++        super().__init__(config)
++        self.config = config
++        self.base_url = config.host.rstrip("/")
++        self.infer_url = f"{self.base_url}/infer"
++        self.session = requests.Session()
++        self.session.headers.update({"Content-Type": "application/msgpack"})
++
++        self.template_model = Linear(1, 1)
++        self.processor = OpenPIDataProcessor(self.config)
++        self.reset()
++
++    def reset(self):
++        self._cur_step = 0
++        self._last_results = None
++
++    @torch.no_grad()
++    def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
++        del kwargs
++        if self._last_results is None:
++            self._last_results = self.predict_action_chunk(batch).cpu().numpy()
++            if len(self._last_results) == 0:
++                raise RuntimeError("OpenPI server returned an empty action chunk.")
++            self._cur_step = 0
++
++        action = self._last_results[self._cur_step]
++        self._cur_step += 1
++
++        max_cached_steps = min(self.config.n_action_steps, len(self._last_results))
++        if self._cur_step >= max_cached_steps:
++            self._last_results = None
++
++        return torch.tensor(action, dtype=torch.float32)
++
++    @torch.no_grad()
++    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
++        del kwargs
++        payload = self.processor.forward_process(batch)
++        action_chunk = self._post(payload)
++        action_chunk = self.processor.backward_process(action_chunk)
++        if len(action_chunk) == 0:
++            raise RuntimeError("OpenPI server returned an empty action chunk.")
++        return torch.tensor(action_chunk, dtype=torch.float32)
++
++    def _post(self, payload: dict) -> np.ndarray:
++        try:
++            packed_observation = packb(payload)
++            resp = self.session.post(self.infer_url, data=packed_observation, timeout=30)
++            resp.raise_for_status()
++            data = unpackb(resp.content)
++            action = np.array(data) if not isinstance(data, dict) else np.array(data.get("actions", data))
++            return action
++        except Exception as e:
++            raise RuntimeError(f"Policy server request failed: {e}") from e
++
++    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
++        del batch
++        loss = torch.tensor(0.0, dtype=torch.float32, device=self.config.device)
++        return loss, None
++
++    def get_optim_params(self) -> dict:
++        return {}
+diff --git a/src/lerobot/policies/openpi_client/processor_openpi_client.py b/src/lerobot/policies/openpi_client/processor_openpi_client.py
+new file mode 100644
+index 00000000..0b37c359
+--- /dev/null
++++ b/src/lerobot/policies/openpi_client/processor_openpi_client.py
+@@ -0,0 +1,107 @@
++from typing import Any
++
++import numpy as np
++import torch
++from einops import rearrange
++from PIL import Image as PILImage
++
++from lerobot.processor import PolicyAction, PolicyProcessorPipeline
++from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
++
++from .configuration_openpi_client import OpenPIClientConfig
++
++
++def convert_to_uint8(img: np.ndarray) -> np.ndarray:
++    if np.issubdtype(img.dtype, np.floating):
++        img = np.clip(255 * img, 0, 255).astype(np.uint8)
++    return img
++
++
++def _resize_with_pad_pil(image: PILImage.Image, height: int, width: int, method: int) -> PILImage.Image:
++    cur_width, cur_height = image.size
++    if cur_width == width and cur_height == height:
++        return image
++    ratio = max(cur_width / width, cur_height / height)
++    resized_height = int(cur_height / ratio)
++    resized_width = int(cur_width / ratio)
++    resized_image = image.resize((resized_width, resized_height), resample=method)
++    zero_image = PILImage.new(resized_image.mode, (width, height), 0)
++    pad_height = max(0, int((height - resized_height) / 2))
++    pad_width = max(0, int((width - resized_width) / 2))
++    zero_image.paste(resized_image, (pad_width, pad_height))
++    return zero_image
++
++
++def resize_with_pad(
++    images: np.ndarray,
++    height: int,
++    width: int,
++    method=PILImage.Resampling.BILINEAR,
++) -> np.ndarray:
++    if images.shape[-3:-1] == (height, width):
++        return images
++
++    original_shape = images.shape
++    images = images.reshape(-1, *original_shape[-3:])
++    resized = np.stack(
++        [
++            np.array(_resize_with_pad_pil(PILImage.fromarray(im), height, width, method=method))
++            for im in images
++        ]
++    )
++    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
++
++
++class OpenPIDataProcessor:
++    def __init__(self, config: OpenPIClientConfig):
++        self.config = config
++
++    def forward_process(self, batch: dict[str, torch.Tensor]) -> dict:
++        payload = {"images": {}}
++
++        if "observation.state" in batch:
++            payload["state"] = batch["observation.state"][0].cpu().numpy()
++        else:
++            joint_values = []
++            for i in range(8):
++                key = f"observation.joint_positions_{i}"
++                if key in batch:
++                    joint_values.append(batch[key][0].item())
++                else:
++                    joint_values.append(0.0)
++            payload["state"] = np.array(joint_values, dtype=np.float32)
++
++        image_keys = [k for k in batch.keys() if "image" in k]
++        for key in image_keys:
++            img_tensor = batch[key][0]
++            img_np = img_tensor.cpu().numpy()
++            img_hwc = rearrange(img_np, "c h w -> h w c")
++            img_hwc_uint8 = convert_to_uint8(img_hwc)
++            img_resized = resize_with_pad(img_hwc_uint8, 224, 224)
++            img_chw = rearrange(img_resized, "h w c -> c h w")
++            short_key = key.split(".")[-1]
++            payload["images"][short_key] = img_chw
++
++        payload["prompt"] = getattr(self.config, "default_prompt", "")
++        return payload
++
++    def backward_process(self, action_chunk: np.ndarray) -> np.ndarray:
++        return action_chunk
++
++
++def make_openpi_client_pre_post_processors(
++    config: OpenPIClientConfig,
++    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
++) -> tuple[
++    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
++    PolicyProcessorPipeline[PolicyAction, PolicyAction],
++]:
++    del config, dataset_stats
++    return (
++        PolicyProcessorPipeline([]),
++        PolicyProcessorPipeline(
++            [],
++            to_transition=policy_action_to_transition,
++            to_output=transition_to_policy_action,
++        ),
++    )
 diff --git a/src/lerobot/rl/actor.py b/src/lerobot/rl/actor.py
 index 18c0ca1e..b65f6a4c 100644
 --- a/src/lerobot/rl/actor.py
@@ -78,6 +847,1021 @@ index fb2504f2..68e8a067 100644
  from lerobot.configs import parser
  from lerobot.configs.train import TrainRLServerPipelineConfig
  from lerobot.datasets.lerobot_dataset import LeRobotDataset
+diff --git a/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/__init__.py b/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/__init__.py
+new file mode 100644
+index 00000000..6aa0ee6f
+--- /dev/null
++++ b/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/__init__.py
+@@ -0,0 +1,6 @@
++#!/usr/bin/env python
++
++from .bi_franka_fr3_robotiq_gripper import BiFrankaFr3RobotiqGripper
++from .config_bi_franka_fr3_robotiq_gripper import BiFrankaFr3RobotiqGripperConfig
++
++__all__ = ["BiFrankaFr3RobotiqGripper", "BiFrankaFr3RobotiqGripperConfig"]
+diff --git a/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/bi_franka_fr3_robotiq_gripper.py b/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/bi_franka_fr3_robotiq_gripper.py
+new file mode 100644
+index 00000000..98fce6cb
+--- /dev/null
++++ b/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/bi_franka_fr3_robotiq_gripper.py
+@@ -0,0 +1,148 @@
++import logging
++from dataclasses import fields
++from pathlib import Path
++from typing import Any
++
++from lerobot.robots.robot import Robot
++from lerobot.robots.franka_fr3_robotiq_gripper.config_franka_fr3_robotiq_gripper import (
++    FrankaFr3RobotiqGripperConfig,
++    FrankaFr3RobotiqGripperConfigBase,
++)
++from lerobot.robots.franka_fr3_robotiq_gripper.franka_fr3_robotiq_gripper import FrankaFr3RobotiqGripper
++from lerobot.types import RobotAction, RobotObservation
++
++from .config_bi_franka_fr3_robotiq_gripper import BiFrankaFr3RobotiqGripperConfig
++
++logger = logging.getLogger(__name__)
++
++
++class BiFrankaFr3RobotiqGripper(Robot):
++    config_class = BiFrankaFr3RobotiqGripperConfig
++    name = "bi_franka_fr3_robotiq_gripper"
++
++    def __init__(self, config: BiFrankaFr3RobotiqGripperConfig):
++        super().__init__(config)
++        self.config = config
++
++        self.left_arm = FrankaFr3RobotiqGripper(self._arm_config(config.left_arm_config, id_suffix="left"))
++        self.right_arm = FrankaFr3RobotiqGripper(self._arm_config(config.right_arm_config, id_suffix="right"))
++        self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
++
++    def _arm_config(
++        self,
++        arm_config: FrankaFr3RobotiqGripperConfigBase,
++        *,
++        id_suffix: str,
++    ) -> FrankaFr3RobotiqGripperConfig:
++        values = {
++            field.name: getattr(arm_config, field.name)
++            for field in fields(FrankaFr3RobotiqGripperConfigBase)
++        }
++        return FrankaFr3RobotiqGripperConfig(
++            id=f"{self.config.id}_{id_suffix}" if self.config.id else None,
++            calibration_dir=self.config.calibration_dir,
++            **values,
++        )
++
++    def _is_camera(self, key: str, arm: FrankaFr3RobotiqGripper) -> bool:
++        return key in arm.cameras
++
++    def _prefix_arm_items(
++        self,
++        values: dict[str, Any],
++        *,
++        arm: FrankaFr3RobotiqGripper,
++        prefix: str,
++    ) -> dict[str, Any]:
++        return {
++            key if self._is_camera(key, arm) else f"{prefix}_{key}": value
++            for key, value in values.items()
++        }
++
++    @staticmethod
++    def _prefix_items(values: dict[str, Any], prefix: str) -> dict[str, Any]:
++        return {f"{prefix}_{key}": value for key, value in values.items()}
++
++    @staticmethod
++    def _strip_prefixed_items(values: dict[str, Any], prefix: str) -> dict[str, Any]:
++        key_prefix = f"{prefix}_"
++        return {
++            key[len(key_prefix) :]: value
++            for key, value in values.items()
++            if key.startswith(key_prefix)
++        }
++
++    @property
++    def observation_features(self) -> dict[str, Any]:
++        features: dict[str, Any] = {}
++        features.update(self._prefix_arm_items(self.left_arm.observation_features, arm=self.left_arm, prefix="left"))
++        features.update(
++            self._prefix_arm_items(self.right_arm.observation_features, arm=self.right_arm, prefix="right")
++        )
++        return features
++
++    @property
++    def action_features(self) -> dict[str, Any]:
++        features: dict[str, Any] = {}
++        features.update(self._prefix_items(self.left_arm.action_features, "left"))
++        features.update(self._prefix_items(self.right_arm.action_features, "right"))
++        return features
++
++    @property
++    def is_connected(self) -> bool:
++        return self.left_arm.is_connected and self.right_arm.is_connected
++
++    def connect(self, calibrate: bool = True) -> None:
++        del calibrate
++        if self.is_connected:
++            return
++        try:
++            self.left_arm.connect()
++            self.right_arm.connect()
++        except Exception:
++            logger.exception("Bimanual Franka connection failed; cleaning up connected arms")
++            self.disconnect()
++            raise
++
++    def disconnect(self) -> None:
++        self.left_arm.disconnect()
++        self.right_arm.disconnect()
++
++    @property
++    def is_calibrated(self) -> bool:
++        return True
++
++    def calibrate(self) -> None:
++        return
++
++    def configure(self) -> None:
++        return
++
++    def get_observation(self) -> RobotObservation:
++        left_obs = self.left_arm.get_observation()
++        right_obs = self.right_arm.get_observation()
++
++        obs: RobotObservation = {}
++        obs.update(self._prefix_arm_items(left_obs, arm=self.left_arm, prefix="left"))
++        obs.update(self._prefix_arm_items(right_obs, arm=self.right_arm, prefix="right"))
++        return obs
++
++    def send_action(self, action: RobotAction) -> RobotAction:
++        left_action = self._strip_prefixed_items(action, "left")
++        right_action = self._strip_prefixed_items(action, "right")
++
++        left_sent = self.left_arm.send_action(left_action)
++        right_sent = self.right_arm.send_action(right_action)
++
++        sent: RobotAction = {}
++        sent.update(self._prefix_items(left_sent, "left"))
++        sent.update(self._prefix_items(right_sent, "right"))
++        return sent
++
++    def _load_calibration(self, fpath: Path | None = None) -> None:
++        del fpath
++        return
++
++    def _save_calibration(self, fpath: Path | None = None) -> None:
++        del fpath
++        return
+diff --git a/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/config_bi_franka_fr3_robotiq_gripper.py b/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/config_bi_franka_fr3_robotiq_gripper.py
+new file mode 100644
+index 00000000..4ed1e33e
+--- /dev/null
++++ b/src/lerobot/robots/bi_franka_fr3_robotiq_gripper/config_bi_franka_fr3_robotiq_gripper.py
+@@ -0,0 +1,23 @@
++from dataclasses import dataclass, field
++
++from lerobot.robots.config import RobotConfig
++from lerobot.robots.franka_fr3_robotiq_gripper.config_franka_fr3_robotiq_gripper import (
++    FrankaFr3RobotiqGripperConfigBase,
++)
++
++from lerobot.franka_rdk.camera_config import default_left_arm_cameras, default_right_arm_cameras
++
++
++def _default_left_arm_config() -> FrankaFr3RobotiqGripperConfigBase:
++    return FrankaFr3RobotiqGripperConfigBase(topic_namespace="left", cameras=default_left_arm_cameras())
++
++
++def _default_right_arm_config() -> FrankaFr3RobotiqGripperConfigBase:
++    return FrankaFr3RobotiqGripperConfigBase(topic_namespace="right", cameras=default_right_arm_cameras())
++
++
++@RobotConfig.register_subclass("bi_franka_fr3_robotiq_gripper")
++@dataclass
++class BiFrankaFr3RobotiqGripperConfig(RobotConfig):
++    left_arm_config: FrankaFr3RobotiqGripperConfigBase = field(default_factory=_default_left_arm_config)
++    right_arm_config: FrankaFr3RobotiqGripperConfigBase = field(default_factory=_default_right_arm_config)
+diff --git a/src/lerobot/robots/franka_fr3_robotiq_gripper/__init__.py b/src/lerobot/robots/franka_fr3_robotiq_gripper/__init__.py
+new file mode 100644
+index 00000000..a4643a52
+--- /dev/null
++++ b/src/lerobot/robots/franka_fr3_robotiq_gripper/__init__.py
+@@ -0,0 +1,13 @@
++#!/usr/bin/env python
++
++from .config_franka_fr3_robotiq_gripper import (
++    FrankaFr3RobotiqGripperConfig,
++    FrankaFr3RobotiqGripperConfigBase,
++)
++from .franka_fr3_robotiq_gripper import FrankaFr3RobotiqGripper
++
++__all__ = [
++    "FrankaFr3RobotiqGripper",
++    "FrankaFr3RobotiqGripperConfig",
++    "FrankaFr3RobotiqGripperConfigBase",
++]
+diff --git a/src/lerobot/robots/franka_fr3_robotiq_gripper/config_franka_fr3_robotiq_gripper.py b/src/lerobot/robots/franka_fr3_robotiq_gripper/config_franka_fr3_robotiq_gripper.py
+new file mode 100644
+index 00000000..575c2f0c
+--- /dev/null
++++ b/src/lerobot/robots/franka_fr3_robotiq_gripper/config_franka_fr3_robotiq_gripper.py
+@@ -0,0 +1,38 @@
++from dataclasses import dataclass, field
++
++from lerobot.cameras import CameraConfig
++from lerobot.robots.config import RobotConfig
++
++from lerobot.franka_rdk.camera_config import default_left_arm_cameras
++
++
++@dataclass
++class FrankaFr3RobotiqGripperConfigBase:
++    ros_domain_id: int | None = None
++    remote_ip: str | None = None
++    topic_namespace: str = "left"
++
++    use_gripper: bool = True
++    gripper_command_topic: str = "/gripper/gripper_client/target_gripper_width_percent"
++    gripper_state_topic: str = "/gripper/joint_states"
++    gripper_state_joint_index: int = 0
++    gripper_max_closed_position: float = 0.085
++
++    arm_state_topic: str = "/franka/joint_states"
++    arm_command_topic: str = "/gello/joint_states"
++
++    state_joint_prefix: str = ""
++
++    use_ft_sensor: bool = False
++    ft_sensor_topic: str = "/franka_robot_state_broadcaster/external_wrench_in_base_frame"
++
++    control_method: str = "joint"
++    use_bridge: bool = True
++
++    cameras: dict[str, CameraConfig] = field(default_factory=default_left_arm_cameras)
++
++
++@RobotConfig.register_subclass("franka_fr3_robotiq_gripper")
++@dataclass
++class FrankaFr3RobotiqGripperConfig(RobotConfig, FrankaFr3RobotiqGripperConfigBase):
++    pass
+diff --git a/src/lerobot/robots/franka_fr3_robotiq_gripper/franka_fr3_robotiq_gripper.py b/src/lerobot/robots/franka_fr3_robotiq_gripper/franka_fr3_robotiq_gripper.py
+new file mode 100644
+index 00000000..6752a8f2
+--- /dev/null
++++ b/src/lerobot/robots/franka_fr3_robotiq_gripper/franka_fr3_robotiq_gripper.py
+@@ -0,0 +1,358 @@
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import os
++import time
++from pathlib import Path
++from threading import Event, Thread
++
++import draccus
++import numpy as np
++
++from lerobot.cameras.utils import make_cameras_from_configs
++from lerobot.motors import MotorCalibration
++from lerobot.robots.robot import Robot
++from lerobot.ros.ros_bridge_client import get_bridge_client
++from lerobot.types import RobotAction, RobotObservation
++
++from .config_franka_fr3_robotiq_gripper import FrankaFr3RobotiqGripperConfig
++
++logger = logging.getLogger(__name__)
++
++ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
++ROBOT_DOF = len(ARM_JOINT_NAMES) + 1
++WRENCH_AXES = ("fx", "fy", "fz", "tx", "ty", "tz")
++CAMERA_MAX_AGE_MS = 500
++
++
++def _namespaced(base_topic: str, namespace: str) -> str:
++    if not namespace:
++        return base_topic
++    ns = namespace.strip("/")
++    topic = base_topic.lstrip("/")
++    return f"/{ns}/{topic}"
++
++
++class FrankaFr3RobotiqGripper(Robot):
++    config_class = FrankaFr3RobotiqGripperConfig
++    name = "franka_fr3_robotiq_gripper"
++
++    def __init__(self, config: FrankaFr3RobotiqGripperConfig):
++        super().__init__(config)
++        self.config = config
++        self.num_dofs = ROBOT_DOF
++        self._connected = False
++
++        self._use_bridge = getattr(self.config, "use_bridge", True)
++        self._bridge_client = None
++
++        self._joint_state_msg = None
++        self._gripper_state_msg = None
++        self._wrench_msg = None
++        self._joint_sub = None
++        self._gripper_sub = None
++        self._wrench_sub = None
++        self._arm_pub = None
++        self._gripper_pub = None
++        self._node = None
++        self._spin_stop = Event()
++        self._spin_thread = None
++
++        self._last_sent_action = {f"joint_positions_{i}": 0.0 for i in range(self.num_dofs)}
++        self.cameras = make_cameras_from_configs(config.cameras)
++
++        self._ns = getattr(self.config, "topic_namespace", "")
++        prefix = getattr(self.config, "state_joint_prefix", "")
++        if not prefix and self._ns:
++            prefix = self._ns.rstrip("_") + "_"
++        self._state_joint_prefix = prefix
++
++    def _connect_bridge(self):
++        domain = getattr(self.config, "ros_domain_id", None)
++        if domain is not None:
++            os.environ["ROS_DOMAIN_ID"] = str(domain)
++        self._bridge_client = get_bridge_client(namespace=self._ns)
++        connected_cameras = []
++        try:
++            self._bridge_client.connect()
++            for cam in self.cameras.values():
++                cam.connect()
++                connected_cameras.append(cam)
++            self._connected = True
++        except Exception:
++            for cam in reversed(connected_cameras):
++                try:
++                    cam.disconnect()
++                except Exception:
++                    pass
++            if self._bridge_client is not None:
++                self._bridge_client.disconnect()
++                self._bridge_client = None
++            raise
++
++    def _get_obs_bridge(self) -> RobotObservation:
++        obs = dict(self._bridge_client.get_observation())
++        for cam_name, cam in self.cameras.items():
++            obs[cam_name] = self._read_camera_frame(cam)
++        return obs
++
++    def _send_action_bridge(self, action: RobotAction) -> RobotAction:
++        sent = {f"joint_positions_{i}": float(action[f"joint_positions_{i}"]) for i in range(ROBOT_DOF)}
++        self._last_sent_action.update(sent)
++        return sent
++
++    def _disconnect_bridge(self):
++        if self._bridge_client is not None:
++            self._bridge_client.disconnect()
++            self._bridge_client = None
++
++    def _joint_callback(self, msg):
++        self._joint_state_msg = msg
++
++    def _gripper_joint_callback(self, msg):
++        self._gripper_state_msg = msg
++
++    def _wrench_callback(self, msg):
++        self._wrench_msg = msg
++
++    def _spin_ros(self) -> None:
++        import rclpy
++
++        while not self._spin_stop.is_set() and rclpy.ok() and self._node is not None:
++            rclpy.spin_once(self._node, timeout_sec=0.05)
++
++    def _get_gripper_observation(self) -> float:
++        if self._gripper_state_msg is not None and self._gripper_state_msg.position:
++            idx = int(getattr(self.config, "gripper_state_joint_index", 0))
++            if 0 <= idx < len(self._gripper_state_msg.position):
++                return float(self._gripper_state_msg.position[idx])
++        return float(self._last_sent_action.get("joint_positions_7", 0.0))
++
++    def _read_arm_observation(self) -> np.ndarray:
++        if self._joint_state_msg is None:
++            return np.zeros(len(ARM_JOINT_NAMES), dtype=np.float32)
++
++        positions_by_name = dict(zip(self._joint_state_msg.name, self._joint_state_msg.position))
++        arm_positions = []
++        for joint_name in ARM_JOINT_NAMES:
++            prefixed_name = f"{self._state_joint_prefix}{joint_name}"
++            value = positions_by_name.get(prefixed_name, positions_by_name.get(joint_name, 0.0))
++            arm_positions.append(value)
++        return np.array(arm_positions, dtype=np.float32)
++
++    def _read_camera_frame(self, cam):
++        try:
++            return cam.read_latest(max_age_ms=CAMERA_MAX_AGE_MS)
++        except (NotImplementedError, AttributeError, TimeoutError, RuntimeError):
++            return cam.read()
++
++    @property
++    def observation_features(self) -> dict:
++        features = {f"joint_positions_{i}": float for i in range(ROBOT_DOF)}
++        if getattr(self.config, "use_ft_sensor", False):
++            for axis in WRENCH_AXES:
++                features[f"wrench_{axis}"] = float
++        if getattr(self.config, "cameras", None):
++            for cam_name, cam_cfg in self.config.cameras.items():
++                features[cam_name] = (cam_cfg.height, cam_cfg.width, 3)
++        return features
++
++    @property
++    def action_features(self) -> dict:
++        return {f"joint_positions_{i}": float for i in range(ROBOT_DOF)}
++
++    @property
++    def is_connected(self) -> bool:
++        return self._connected
++
++    def connect(self, calibrate: bool = True) -> None:
++        del calibrate
++        if self._connected:
++            return
++
++        if self._use_bridge:
++            self._connect_bridge()
++            return
++
++        import rclpy
++        from geometry_msgs.msg import WrenchStamped as WrenchStampedMsg
++        from rclpy.node import Node
++        from sensor_msgs.msg import JointState as JointStateMsg
++        from std_msgs.msg import Float32 as Float32Msg
++
++        if not rclpy.ok():
++            domain = getattr(self.config, "ros_domain_id", None)
++            if domain is not None:
++                os.environ["ROS_DOMAIN_ID"] = str(domain)
++            rclpy.init()
++
++        ns = self._ns
++        arm_state_topic = _namespaced(self.config.arm_state_topic, ns)
++        gripper_state_topic = _namespaced(self.config.gripper_state_topic, ns)
++        arm_command_topic = _namespaced(self.config.arm_command_topic, ns)
++        gripper_command_topic = _namespaced(self.config.gripper_command_topic, ns)
++
++        node_name = f"franka_fr3_{ns}" if ns else "franka_fr3_robotiq_gripper"
++        self._node = Node(node_name)
++
++        self._joint_sub = self._node.create_subscription(JointStateMsg, arm_state_topic, self._joint_callback, 10)
++        self._gripper_sub = self._node.create_subscription(
++            JointStateMsg, gripper_state_topic, self._gripper_joint_callback, 10
++        )
++        if getattr(self.config, "use_ft_sensor", False):
++            ft_topic = _namespaced(self.config.ft_sensor_topic, ns)
++            self._wrench_sub = self._node.create_subscription(
++                WrenchStampedMsg, ft_topic, self._wrench_callback, 10
++            )
++
++        self._arm_pub = self._node.create_publisher(JointStateMsg, arm_command_topic, 10)
++        self._gripper_pub = self._node.create_publisher(Float32Msg, gripper_command_topic, 10)
++
++        for cam in self.cameras.values():
++            cam.connect()
++
++        self._spin_stop.clear()
++        self._spin_thread = Thread(target=self._spin_ros, name="franka_ros_spin", daemon=True)
++        self._spin_thread.start()
++
++        t0 = time.time()
++        while self._joint_state_msg is None and time.time() - t0 < 3.0:
++            time.sleep(0.02)
++
++        self._connected = True
++
++    @property
++    def is_calibrated(self) -> bool:
++        return True
++
++    def calibrate(self) -> None:
++        return
++
++    def _load_calibration(self, fpath: Path | None = None) -> None:
++        fpath = self.calibration_fpath if fpath is None else fpath
++        with open(fpath) as f, draccus.config_type("json"):
++            self.calibration = draccus.load(dict[str, MotorCalibration], f)
++
++    def _save_calibration(self, fpath: Path | None = None) -> None:
++        fpath = self.calibration_fpath if fpath is None else fpath
++        with open(fpath, "w") as f, draccus.config_type("json"):
++            draccus.dump(self.calibration, f, indent=4)
++
++    def configure(self) -> None:
++        return
++
++    def get_observation(self) -> RobotObservation:
++        if not self._connected:
++            raise RuntimeError("Robot is not connected. Call connect() first.")
++
++        if self._use_bridge:
++            return self._get_obs_bridge()
++
++        arm = self._read_arm_observation()
++        gripper = self._get_gripper_observation()
++        joints = np.append(arm, gripper)
++
++        obs: RobotObservation = {}
++        for i, value in enumerate(joints):
++            obs[f"joint_positions_{i}"] = float(value)
++
++        if getattr(self.config, "use_ft_sensor", False):
++            if self._wrench_msg is None:
++                for axis in WRENCH_AXES:
++                    obs[f"wrench_{axis}"] = 0.0
++            else:
++                force = self._wrench_msg.wrench.force
++                torque = self._wrench_msg.wrench.torque
++                obs["wrench_fx"] = float(force.x)
++                obs["wrench_fy"] = float(force.y)
++                obs["wrench_fz"] = float(force.z)
++                obs["wrench_tx"] = float(torque.x)
++                obs["wrench_ty"] = float(torque.y)
++                obs["wrench_tz"] = float(torque.z)
++
++        for cam_name, cam in self.cameras.items():
++            obs[cam_name] = self._read_camera_frame(cam)
++
++        return obs
++
++    def send_action(self, action: RobotAction) -> RobotAction:
++        if not self._connected:
++            raise RuntimeError("Robot is not connected. Call connect() first.")
++
++        if self._use_bridge:
++            return self._send_action_bridge(action)
++
++        if self._node is None or self._arm_pub is None:
++            raise RuntimeError("Robot is not connected. Call connect() first.")
++
++        from sensor_msgs.msg import JointState as JointStateMsg
++        from std_msgs.msg import Float32 as Float32Msg
++
++        arm = np.array(
++            [float(action[f"joint_positions_{i}"]) for i in range(len(ARM_JOINT_NAMES))],
++            dtype=np.float32,
++        )
++
++        arm_msg = JointStateMsg()
++        arm_msg.header.stamp = self._node.get_clock().now().to_msg()
++        arm_msg.header.frame_id = "fr3_link0"
++        arm_msg.name = list(ARM_JOINT_NAMES)
++        arm_msg.position = [float(v) for v in arm]
++        self._arm_pub.publish(arm_msg)
++
++        sent: RobotAction = {f"joint_positions_{i}": float(arm[i]) for i in range(len(ARM_JOINT_NAMES))}
++        if self.config.use_gripper:
++            raw_gripper = float(action.get("joint_positions_7", self._last_sent_action["joint_positions_7"]))
++            max_closed = getattr(self.config, "gripper_max_closed_position", None)
++            if max_closed is not None:
++                raw_gripper = float(np.clip(raw_gripper, 0.0, float(max_closed)))
++            if self._gripper_pub is not None:
++                g_msg = Float32Msg()
++                if max_closed is not None and float(max_closed) > 0.0:
++                    g_msg.data = 1.0 - (raw_gripper / float(max_closed))
++                else:
++                    g_msg.data = raw_gripper
++                self._gripper_pub.publish(g_msg)
++            sent["joint_positions_7"] = raw_gripper
++
++        self._last_sent_action.update(sent)
++        return sent
++
++    def disconnect(self) -> None:
++        if not self._connected:
++            return
++
++        for cam in self.cameras.values():
++            cam.disconnect()
++
++        if self._use_bridge:
++            self._disconnect_bridge()
++            self._connected = False
++            return
++
++        self._spin_stop.set()
++        if self._spin_thread is not None:
++            self._spin_thread.join(timeout=1.0)
++
++        if self._node is not None:
++            self._node.destroy_node()
++            self._node = None
++
++        self._joint_sub = None
++        self._gripper_sub = None
++        self._wrench_sub = None
++        self._arm_pub = None
++        self._gripper_pub = None
++        self._connected = False
+diff --git a/src/lerobot/ros/__init__.py b/src/lerobot/ros/__init__.py
+new file mode 100644
+index 00000000..bf251d45
+--- /dev/null
++++ b/src/lerobot/ros/__init__.py
+@@ -0,0 +1,5 @@
++#!/usr/bin/env python
++
++from .ros_bridge_client import RosBridgeClient, get_bridge_client
++
++__all__ = ["RosBridgeClient", "get_bridge_client"]
+diff --git a/src/lerobot/ros/ros_bridge.py b/src/lerobot/ros/ros_bridge.py
+new file mode 100644
+index 00000000..a179515b
+--- /dev/null
++++ b/src/lerobot/ros/ros_bridge.py
+@@ -0,0 +1,222 @@
++#!/usr/bin/env python3.10
++"""
++ROS 2 bridge: subscribes to robot state and GELLO action topics, then writes the
++latest snapshot to a shared-memory JSON file.
++"""
++
++import argparse
++import json
++import os
++import signal
++import time
++
++from geometry_msgs.msg import WrenchStamped
++import rclpy
++from rclpy.node import Node
++from sensor_msgs.msg import JointState
++from std_msgs.msg import Float32
++
++ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
++WRENCH_AXES = ("fx", "fy", "fz", "tx", "ty", "tz")
++ROBOTIQ_MAX_CLOSED_POSITION = 0.085
++
++
++class LerobotRosBridge(Node):
++    def __init__(self, namespace: str):
++        ns = namespace.strip("/") if namespace else ""
++        node_name = f"lerobot_ros_bridge_{ns}" if ns else "lerobot_ros_bridge"
++        super().__init__(node_name)
++        prefix = f"/{ns}" if ns else ""
++        now = time.time()
++
++        self._arm_msg: JointState | None = None
++        self._gripper_msg: JointState | None = None
++        self._wrench_msg: WrenchStamped | None = None
++        self._gello_arm_msg: JointState | None = None
++        self._gello_gripper_percent_msg: Float32 | None = None
++        self._gello_gripper_raw_msg: Float32 | None = None
++        self._namespace = ns
++        self._started_at = now
++        self._counts = {
++            "arm": 0,
++            "gripper": 0,
++            "wrench": 0,
++            "gello_arm": 0,
++            "gello_gripper": 0,
++        }
++        self._last_seen = {key: None for key in self._counts}
++
++        self.create_subscription(JointState, f"{prefix}/franka/joint_states", self._arm_cb, 10)
++        self.create_subscription(JointState, f"{prefix}/gripper/joint_states", self._gripper_cb, 10)
++        self.create_subscription(
++            WrenchStamped,
++            f"{prefix}/franka_robot_state_broadcaster/external_wrench_in_base_frame",
++            self._wrench_cb,
++            10,
++        )
++
++        self.create_subscription(JointState, f"{prefix}/gello/joint_states", self._gello_arm_cb, 10)
++        self.create_subscription(
++            Float32,
++            f"{prefix}/gripper/gripper_client/target_gripper_width_percent",
++            self._gello_gripper_percent_cb,
++            10,
++        )
++        self.create_subscription(Float32, f"{prefix}/gello/gripper_position", self._gello_gripper_raw_cb, 10)
++
++        self._state_joint_prefix = f"{ns}_" if ns else ""
++
++    def _mark_seen(self, source: str) -> None:
++        self._counts[source] += 1
++        self._last_seen[source] = time.time()
++
++    def _arm_cb(self, msg: JointState) -> None:
++        self._arm_msg = msg
++        self._mark_seen("arm")
++
++    def _gripper_cb(self, msg: JointState) -> None:
++        self._gripper_msg = msg
++        self._mark_seen("gripper")
++
++    def _wrench_cb(self, msg: WrenchStamped) -> None:
++        self._wrench_msg = msg
++        self._mark_seen("wrench")
++
++    def _gello_arm_cb(self, msg: JointState) -> None:
++        self._gello_arm_msg = msg
++        self._mark_seen("gello_arm")
++
++    def _gello_gripper_percent_cb(self, msg: Float32) -> None:
++        self._gello_gripper_percent_msg = Float32(data=msg.data)
++        self._mark_seen("gello_gripper")
++
++    def _gello_gripper_raw_cb(self, msg: Float32) -> None:
++        self._gello_gripper_raw_msg = Float32(data=msg.data)
++        self._mark_seen("gello_gripper")
++
++    def _read_joint_positions(self, msg: JointState | None, *, allow_state_prefix: bool) -> list[float]:
++        if msg is None or not msg.name:
++            return [0.0] * len(ARM_JOINT_NAMES)
++
++        positions_by_name = dict(zip(msg.name, msg.position))
++        positions = []
++        for joint_name in ARM_JOINT_NAMES:
++            candidate_names = [joint_name]
++            if allow_state_prefix and self._state_joint_prefix:
++                candidate_names.insert(0, f"{self._state_joint_prefix}{joint_name}")
++            positions.append(
++                next((float(positions_by_name[name]) for name in candidate_names if name in positions_by_name), 0.0)
++            )
++        return positions
++
++    def _read_arm_joints(self) -> list[float]:
++        return self._read_joint_positions(self._arm_msg, allow_state_prefix=True)
++
++    def _read_gripper(self) -> float:
++        if self._gripper_msg is not None and self._gripper_msg.position:
++            return float(self._gripper_msg.position[0])
++        return 0.0
++
++    def _read_wrench(self) -> dict[str, float]:
++        if self._wrench_msg is None:
++            return {f"wrench_{axis}": 0.0 for axis in WRENCH_AXES}
++        force = self._wrench_msg.wrench.force
++        torque = self._wrench_msg.wrench.torque
++        return {
++            "wrench_fx": float(force.x),
++            "wrench_fy": float(force.y),
++            "wrench_fz": float(force.z),
++            "wrench_tx": float(torque.x),
++            "wrench_ty": float(torque.y),
++            "wrench_tz": float(torque.z),
++        }
++
++    def _read_gello_arm(self) -> list[float]:
++        return self._read_joint_positions(self._gello_arm_msg, allow_state_prefix=False)
++
++    def _read_gello_gripper(self) -> float:
++        if self._gello_gripper_raw_msg is not None:
++            return float(self._gello_gripper_raw_msg.data)
++        if self._gello_gripper_percent_msg is not None:
++            open_percent = max(0.0, min(1.0, float(self._gello_gripper_percent_msg.data)))
++            return ROBOTIQ_MAX_CLOSED_POSITION * (1.0 - open_percent)
++        return 0.0
++
++    def get_state(self) -> dict:
++        now = time.time()
++        arm = self._read_arm_joints()
++        gripper = self._read_gripper()
++        gello_arm = self._read_gello_arm()
++        gello_gripper = self._read_gello_gripper()
++
++        return {
++            "observation": {
++                **{f"joint_positions_{i}": arm[i] for i in range(len(ARM_JOINT_NAMES))},
++                "joint_positions_7": gripper,
++                **self._read_wrench(),
++            },
++            "action": {
++                **{f"joint_positions_{i}": gello_arm[i] for i in range(len(ARM_JOINT_NAMES))},
++                "joint_positions_7": gello_gripper,
++            },
++            "metadata": {
++                "namespace": self._namespace,
++                "started_at": self._started_at,
++                "timestamp": now,
++                "gripper_convention": "raw_robotiq_position",
++                "counts": dict(self._counts),
++                "received": {key: count > 0 for key, count in self._counts.items()},
++                "age_s": {key: None if last is None else now - last for key, last in self._last_seen.items()},
++            },
++        }
++
++
++def main():
++    parser = argparse.ArgumentParser(description="ROS 2 -> LeRobot bridge")
++    parser.add_argument("--namespace", default="left", help="Topic namespace (left, right)")
++    parser.add_argument("--fps", type=int, default=30, help="Output rate")
++    parser.add_argument(
++        "--output",
++        default=None,
++        help="Output file path (default: /dev/shm/lerobot_state_<ns>.json)",
++    )
++    args = parser.parse_args()
++
++    rclpy.init()
++    bridge = LerobotRosBridge(args.namespace)
++    out_path = args.output or f"/dev/shm/lerobot_state_{args.namespace}.json"
++    period = 1.0 / args.fps
++
++    running = True
++
++    def _shutdown(sig, frame):
++        del sig, frame
++        nonlocal running
++        running = False
++
++    signal.signal(signal.SIGINT, _shutdown)
++    signal.signal(signal.SIGTERM, _shutdown)
++
++    try:
++        while running and rclpy.ok():
++            rclpy.spin_once(bridge, timeout_sec=0.01)
++            state = bridge.get_state()
++            tmp_path = out_path + ".tmp"
++            with open(tmp_path, "w") as f:
++                json.dump(state, f)
++            os.replace(tmp_path, out_path)
++            time.sleep(period)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        bridge.destroy_node()
++        rclpy.shutdown()
++        for path in (out_path, out_path + ".tmp"):
++            try:
++                os.unlink(path)
++            except OSError:
++                pass
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/lerobot/ros/ros_bridge_client.py b/src/lerobot/ros/ros_bridge_client.py
+new file mode 100644
+index 00000000..3222827d
+--- /dev/null
++++ b/src/lerobot/ros/ros_bridge_client.py
+@@ -0,0 +1,148 @@
++"""
++Bridge client for LeRobot: reads robot state and action from a shared-memory
++JSON file written by the Python 3.10 `ros_bridge.py` process.
++"""
++
++import json
++import logging
++import os
++import subprocess
++import time
++from pathlib import Path
++from threading import Lock
++
++logger = logging.getLogger(__name__)
++
++_instances: dict[str, "RosBridgeClient"] = {}
++_lock = Lock()
++PYTHON310 = "/usr/bin/python3.10"
++
++
++def _without_conda_paths(value: str) -> str:
++    if not value:
++        return value
++    parts = [
++        part
++        for part in value.split(os.pathsep)
++        if part and "/conda" not in part and "/miniconda" not in part
++    ]
++    return os.pathsep.join(parts)
++
++
++def _bridge_env() -> dict[str, str]:
++    env = os.environ.copy()
++    for key in ("PYTHONHOME", "CONDA_PREFIX", "CONDA_DEFAULT_ENV"):
++        env.pop(key, None)
++
++    for key in ("LD_LIBRARY_PATH", "PATH", "PYTHONPATH"):
++        if key in env:
++            env[key] = _without_conda_paths(env[key])
++
++    log_dir = Path(env.get("ROS_LOG_DIR", "/tmp/lerobot_ros_logs"))
++    log_dir.mkdir(parents=True, exist_ok=True)
++    env["ROS_LOG_DIR"] = str(log_dir)
++    return env
++
++
++def get_bridge_client(namespace: str = "left", fps: int = 30) -> "RosBridgeClient":
++    with _lock:
++        domain = os.getenv("ROS_DOMAIN_ID", "")
++        key = f"{namespace}:{fps}:{domain}"
++        if key not in _instances:
++            _instances[key] = RosBridgeClient(namespace=namespace, fps=fps)
++        return _instances[key]
++
++
++class RosBridgeClient:
++    def __init__(self, namespace: str = "left", fps: int = 30):
++        self._ns = namespace
++        self._fps = fps
++        self._state_path = f"/dev/shm/lerobot_state_{namespace}.json"
++        self._bridge_proc: subprocess.Popen | None = None
++        self._connected = False
++
++    @property
++    def state_path(self) -> str:
++        return self._state_path
++
++    def _find_bridge_script(self) -> Path:
++        candidate = Path(__file__).resolve().with_name("ros_bridge.py")
++        if candidate.exists():
++            return candidate
++        raise FileNotFoundError(f"ros_bridge.py not found: {candidate}")
++
++    def connect(self) -> None:
++        if self._connected:
++            return
++
++        bridge_script = self._find_bridge_script()
++
++        try:
++            os.unlink(self._state_path)
++        except FileNotFoundError:
++            pass
++
++        cmd = [
++            PYTHON310,
++            str(bridge_script),
++            "--namespace",
++            self._ns,
++            "--fps",
++            str(self._fps),
++            "--output",
++            self._state_path,
++        ]
++        logger.info("Starting ROS bridge: %s", " ".join(cmd))
++
++        self._bridge_proc = subprocess.Popen(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True,
++            env=_bridge_env(),
++        )
++
++        t0 = time.time()
++        while not os.path.exists(self._state_path) and time.time() - t0 < 5.0:
++            if self._bridge_proc.poll() is not None:
++                out = self._bridge_proc.stdout.read() if self._bridge_proc.stdout else ""
++                raise RuntimeError(f"ROS bridge exited early (code={self._bridge_proc.returncode}): {out}")
++            time.sleep(0.1)
++
++        if not os.path.exists(self._state_path):
++            raise RuntimeError(f"ROS bridge did not create state file within 5s: {self._state_path}")
++
++        self._connected = True
++
++    def _read_state(self) -> dict:
++        try:
++            with open(self._state_path) as f:
++                return json.load(f)
++        except (FileNotFoundError, json.JSONDecodeError):
++            return {}
++
++    def get_observation(self) -> dict:
++        return self._read_state().get("observation", {})
++
++    def get_action(self) -> dict:
++        return self._read_state().get("action", {})
++
++    def get_metadata(self) -> dict:
++        return self._read_state().get("metadata", {})
++
++    def disconnect(self) -> None:
++        if self._bridge_proc is not None:
++            self._bridge_proc.terminate()
++            try:
++                self._bridge_proc.wait(timeout=3.0)
++            except subprocess.TimeoutExpired:
++                self._bridge_proc.kill()
++            self._bridge_proc = None
++        self._connected = False
++
++    @property
++    def is_connected(self) -> bool:
++        return self._connected
++
++    def __del__(self):
++        self.disconnect()
 diff --git a/src/lerobot/scripts/lerobot_calibrate.py b/src/lerobot/scripts/lerobot_calibrate.py
 index 24206797..50e123ea 100644
 --- a/src/lerobot/scripts/lerobot_calibrate.py
@@ -212,6 +1996,367 @@ index f050d572..33aca917 100644
  from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
  from lerobot.configs import parser
  from lerobot.processor import (
+diff --git a/src/lerobot/teleoperators/bi_gello_leader/__init__.py b/src/lerobot/teleoperators/bi_gello_leader/__init__.py
+new file mode 100644
+index 00000000..05e49c8b
+--- /dev/null
++++ b/src/lerobot/teleoperators/bi_gello_leader/__init__.py
+@@ -0,0 +1,6 @@
++#!/usr/bin/env python
++
++from .bi_gello_leader import BiGelloRosLeader
++from .config_bi_gello_leader import BiGelloRosLeaderConfig
++
++__all__ = ["BiGelloRosLeader", "BiGelloRosLeaderConfig"]
+diff --git a/src/lerobot/teleoperators/bi_gello_leader/bi_gello_leader.py b/src/lerobot/teleoperators/bi_gello_leader/bi_gello_leader.py
+new file mode 100644
+index 00000000..06310dfb
+--- /dev/null
++++ b/src/lerobot/teleoperators/bi_gello_leader/bi_gello_leader.py
+@@ -0,0 +1,99 @@
++import logging
++from dataclasses import fields
++from typing import Any
++
++from lerobot.teleoperators import Teleoperator
++from lerobot.teleoperators.gello_leader.config_gello_ros_leader import (
++    GelloRosLeaderConfig,
++    GelloRosLeaderConfigBase,
++)
++from lerobot.teleoperators.gello_leader.gello_ros_leader import GelloRosLeader
++from lerobot.types import RobotAction
++
++from .config_bi_gello_leader import BiGelloRosLeaderConfig
++
++logger = logging.getLogger(__name__)
++
++
++class BiGelloRosLeader(Teleoperator):
++    config_class = BiGelloRosLeaderConfig
++    name = "bi_gello_ros_leader"
++    is_passive = True
++
++    def __init__(self, config: BiGelloRosLeaderConfig | None = None):
++        self.config = config or BiGelloRosLeaderConfig()
++        super().__init__(self.config)
++
++        self.left_arm = GelloRosLeader(self._arm_config(self.config.left_arm_config, id_suffix="left"))
++        self.right_arm = GelloRosLeader(self._arm_config(self.config.right_arm_config, id_suffix="right"))
++
++    def _arm_config(
++        self,
++        arm_config: GelloRosLeaderConfigBase,
++        *,
++        id_suffix: str,
++    ) -> GelloRosLeaderConfig:
++        values = {field.name: getattr(arm_config, field.name) for field in fields(GelloRosLeaderConfigBase)}
++        return GelloRosLeaderConfig(
++            id=f"{self.config.id}_{id_suffix}" if self.config.id else None,
++            calibration_dir=self.config.calibration_dir,
++            **values,
++        )
++
++    @staticmethod
++    def _prefix_items(values: dict[str, Any], prefix: str) -> dict[str, Any]:
++        return {f"{prefix}_{key}": value for key, value in values.items()}
++
++    @property
++    def action_features(self) -> dict[str, type]:
++        features: dict[str, type] = {}
++        features.update(self._prefix_items(self.left_arm.action_features, "left"))
++        features.update(self._prefix_items(self.right_arm.action_features, "right"))
++        return features
++
++    @property
++    def feedback_features(self) -> dict[str, type]:
++        return {}
++
++    @property
++    def is_connected(self) -> bool:
++        return self.left_arm.is_connected and self.right_arm.is_connected
++
++    def connect(self, calibrate: bool = True) -> None:
++        del calibrate
++        if self.is_connected:
++            return
++        try:
++            self.left_arm.connect()
++            self.right_arm.connect()
++        except Exception:
++            logger.exception("Bimanual Gello connection failed; cleaning up connected listeners")
++            self.disconnect()
++            raise
++
++    def disconnect(self) -> None:
++        self.left_arm.disconnect()
++        self.right_arm.disconnect()
++
++    @property
++    def is_calibrated(self) -> bool:
++        return True
++
++    def calibrate(self) -> None:
++        return
++
++    def configure(self) -> None:
++        return
++
++    def send_feedback(self, feedback: dict) -> None:
++        del feedback
++        return
++
++    def get_action(self) -> RobotAction:
++        left_action = self.left_arm.get_action()
++        right_action = self.right_arm.get_action()
++
++        action: RobotAction = {}
++        action.update(self._prefix_items(left_action, "left"))
++        action.update(self._prefix_items(right_action, "right"))
++        return action
+diff --git a/src/lerobot/teleoperators/bi_gello_leader/config_bi_gello_leader.py b/src/lerobot/teleoperators/bi_gello_leader/config_bi_gello_leader.py
+new file mode 100644
+index 00000000..9afb6d3a
+--- /dev/null
++++ b/src/lerobot/teleoperators/bi_gello_leader/config_bi_gello_leader.py
+@@ -0,0 +1,13 @@
++from dataclasses import dataclass, field
++
++from lerobot.teleoperators.config import TeleoperatorConfig
++from lerobot.teleoperators.gello_leader.config_gello_ros_leader import GelloRosLeaderConfigBase
++
++
++@TeleoperatorConfig.register_subclass("bi_gello_ros_leader")
++@dataclass
++class BiGelloRosLeaderConfig(TeleoperatorConfig):
++    left_arm_config: GelloRosLeaderConfigBase = field(default_factory=GelloRosLeaderConfigBase)
++    right_arm_config: GelloRosLeaderConfigBase = field(
++        default_factory=lambda: GelloRosLeaderConfigBase(topic_namespace="right")
++    )
+diff --git a/src/lerobot/teleoperators/gello_leader/__init__.py b/src/lerobot/teleoperators/gello_leader/__init__.py
+new file mode 100644
+index 00000000..e64a53ba
+--- /dev/null
++++ b/src/lerobot/teleoperators/gello_leader/__init__.py
+@@ -0,0 +1,6 @@
++#!/usr/bin/env python
++
++from .config_gello_ros_leader import GelloRosLeaderConfig, GelloRosLeaderConfigBase
++from .gello_ros_leader import GelloRosLeader
++
++__all__ = ["GelloRosLeader", "GelloRosLeaderConfig", "GelloRosLeaderConfigBase"]
+diff --git a/src/lerobot/teleoperators/gello_leader/config_gello_ros_leader.py b/src/lerobot/teleoperators/gello_leader/config_gello_ros_leader.py
+new file mode 100644
+index 00000000..1372fe2c
+--- /dev/null
++++ b/src/lerobot/teleoperators/gello_leader/config_gello_ros_leader.py
+@@ -0,0 +1,21 @@
++from dataclasses import dataclass
++
++from lerobot.teleoperators.config import TeleoperatorConfig
++
++
++@dataclass
++class GelloRosLeaderConfigBase:
++    ros_domain_id: int | None = None
++    topic_namespace: str = "left"
++    use_bridge: bool = True
++
++    arm_command_topic: str = "/gello/joint_states"
++    gripper_command_topic: str = "/gripper/gripper_client/target_gripper_width_percent"
++    gripper_raw_topic: str = "/gello/gripper_position"
++    gripper_max_closed_position: float = 0.085
++
++
++@TeleoperatorConfig.register_subclass("gello_ros_leader")
++@dataclass
++class GelloRosLeaderConfig(TeleoperatorConfig, GelloRosLeaderConfigBase):
++    pass
+diff --git a/src/lerobot/teleoperators/gello_leader/gello_ros_leader.py b/src/lerobot/teleoperators/gello_leader/gello_ros_leader.py
+new file mode 100644
+index 00000000..1c6b6ac2
+--- /dev/null
++++ b/src/lerobot/teleoperators/gello_leader/gello_ros_leader.py
+@@ -0,0 +1,180 @@
++import logging
++import os
++import time
++from threading import Event, Thread
++
++from lerobot.teleoperators import Teleoperator
++from lerobot.types import RobotAction
++from lerobot.ros.ros_bridge_client import get_bridge_client
++
++from .config_gello_ros_leader import GelloRosLeaderConfig
++
++logger = logging.getLogger(__name__)
++
++ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
++ROBOT_DOF = len(ARM_JOINT_NAMES) + 1
++
++
++def _namespaced(base_topic: str, namespace: str) -> str:
++    if not namespace:
++        return base_topic
++    ns = namespace.strip("/")
++    topic = base_topic.lstrip("/")
++    return f"/{ns}/{topic}"
++
++
++class GelloRosLeader(Teleoperator):
++    config_class = GelloRosLeaderConfig
++    name = "gello_ros_leader"
++    is_passive = True
++
++    def __init__(self, config: GelloRosLeaderConfig | None = None):
++        self.config = config if config else GelloRosLeaderConfig()
++        super().__init__(self.config)
++        self._connected = False
++        self._node = None
++        self._executor = None
++        self._spin_stop = Event()
++        self._spin_thread = None
++
++        self.num_dofs = ROBOT_DOF
++        self._last_arm_cmd = [0.0] * len(ARM_JOINT_NAMES)
++        self._last_gripper_cmd = 0.0
++        self._last_gripper_raw_msg_at = 0.0
++
++        self._ns = getattr(self.config, "topic_namespace", "")
++        self._use_bridge = getattr(self.config, "use_bridge", True)
++        self._bridge_client = None
++
++    @property
++    def action_features(self) -> dict[str, type]:
++        return {f"joint_positions_{i}": float for i in range(ROBOT_DOF)}
++
++    @property
++    def feedback_features(self) -> dict[str, type]:
++        return {}
++
++    @property
++    def is_calibrated(self) -> bool:
++        return True
++
++    def calibrate(self) -> None:
++        return
++
++    def configure(self) -> None:
++        return
++
++    def send_feedback(self, feedback: dict) -> None:
++        del feedback
++        return
++
++    @property
++    def is_connected(self) -> bool:
++        return self._connected
++
++    def connect(self, calibrate: bool = True) -> None:
++        del calibrate
++        if self._connected:
++            return
++
++        if self._use_bridge:
++            self._connect_bridge()
++            return
++
++        import rclpy
++        from rclpy.executors import SingleThreadedExecutor
++        from rclpy.node import Node
++        from sensor_msgs.msg import JointState
++        from std_msgs.msg import Float32
++
++        if not rclpy.ok():
++            domain = getattr(self.config, "ros_domain_id", None)
++            if domain is not None:
++                os.environ["ROS_DOMAIN_ID"] = str(domain)
++            rclpy.init()
++
++        arm_cmd_topic = _namespaced(self.config.arm_command_topic, self._ns)
++        gripper_cmd_topic = _namespaced(self.config.gripper_command_topic, self._ns)
++        gripper_raw_topic = _namespaced(self.config.gripper_raw_topic, self._ns)
++
++        self._node = Node("gello_listener_for_lerobot")
++        self._executor = SingleThreadedExecutor()
++        self._executor.add_node(self._node)
++
++        self._node.create_subscription(JointState, arm_cmd_topic, self._arm_cb, 10)
++        self._node.create_subscription(Float32, gripper_cmd_topic, self._gripper_percent_cb, 10)
++        self._node.create_subscription(Float32, gripper_raw_topic, self._gripper_raw_cb, 10)
++
++        self._spin_stop.clear()
++        self._spin_thread = Thread(target=self._spin_ros, name="gello_listener_spin", daemon=True)
++        self._spin_thread.start()
++
++        time.sleep(0.5)
++        self._connected = True
++
++    def _connect_bridge(self) -> None:
++        self._bridge_client = get_bridge_client(namespace=self._ns)
++        self._bridge_client.connect()
++        self._connected = True
++
++    def _spin_ros(self) -> None:
++        import rclpy
++
++        while not self._spin_stop.is_set() and rclpy.ok() and self._node is not None:
++            try:
++                if self._executor is not None:
++                    self._executor.spin_once(timeout_sec=0.05)
++            except (RuntimeError, ValueError) as e:
++                logger.warning("gello listener spin interrupted: %s", e)
++                break
++
++    def _arm_cb(self, msg) -> None:
++        if hasattr(msg, "position") and len(msg.position) >= len(ARM_JOINT_NAMES):
++            positions_by_name = dict(zip(msg.name, msg.position))
++            self._last_arm_cmd = [float(positions_by_name.get(joint_name, 0.0)) for joint_name in ARM_JOINT_NAMES]
++
++    def _gripper_percent_cb(self, msg) -> None:
++        if time.time() - self._last_gripper_raw_msg_at < 0.5:
++            return
++        open_percent = max(0.0, min(1.0, float(msg.data)))
++        max_closed = float(getattr(self.config, "gripper_max_closed_position", 0.085))
++        self._last_gripper_cmd = max_closed * (1.0 - open_percent)
++
++    def _gripper_raw_cb(self, msg) -> None:
++        self._last_gripper_cmd = float(msg.data)
++        self._last_gripper_raw_msg_at = time.time()
++
++    def get_action(self) -> RobotAction:
++        if self._use_bridge and self._bridge_client is not None:
++            return dict(self._bridge_client.get_action())
++
++        action = {}
++        for i, val in enumerate(self._last_arm_cmd):
++            action[f"joint_positions_{i}"] = float(val)
++        action["joint_positions_7"] = float(self._last_gripper_cmd)
++        return action
++
++    def disconnect(self) -> None:
++        if not self._connected:
++            return
++
++        if self._use_bridge:
++            if self._bridge_client is not None:
++                self._bridge_client.disconnect()
++                self._bridge_client = None
++            self._connected = False
++            return
++
++        self._spin_stop.set()
++        if self._spin_thread is not None:
++            self._spin_thread.join(timeout=1.0)
++
++        if self._node is not None:
++            if self._executor is not None:
++                self._executor.remove_node(self._node)
++                self._executor.shutdown(timeout_sec=0.5)
++                self._executor = None
++            self._node.destroy_node()
++            self._node = None
++
++        self._connected = False
 diff --git a/src/lerobot/utils/import_utils.py b/src/lerobot/utils/import_utils.py
 index 2b26b230..e835e113 100644
 --- a/src/lerobot/utils/import_utils.py
@@ -229,3 +2374,964 @@ index 2b26b230..e835e113 100644
 +        logging.debug("Franka RDK local plugin package is not available or failed to import.", exc_info=True)
 +
      logging.debug("Third-party plugin import summary: imported=%s failed=%s", imported, failed)
+diff --git a/tests/cameras/test_camera.py b/tests/cameras/test_camera.py
+new file mode 100644
+index 00000000..fef64934
+--- /dev/null
++++ b/tests/cameras/test_camera.py
+@@ -0,0 +1,50 @@
++import argparse
++import time
++
++from lerobot.cameras.utils import make_cameras_from_configs
++from lerobot.franka_rdk.camera_config import default_left_arm_cameras
++from lerobot.utils.import_utils import register_third_party_plugins
++
++
++def summarize_frame(frame):
++    shape = getattr(frame, "shape", None)
++    dtype = getattr(frame, "dtype", None)
++    if shape is not None and dtype is not None:
++        return f"shape={tuple(shape)}, dtype={dtype}"
++    return f"type={type(frame)}"
++
++
++def main() -> int:
++    register_third_party_plugins()
++    parser = argparse.ArgumentParser(description="Test LeRobot camera read for Franka config.")
++    parser.add_argument("--frames", type=int, default=10)
++    parser.add_argument("--interval", type=float, default=0.1)
++    args = parser.parse_args()
++
++    cameras = make_cameras_from_configs(default_left_arm_cameras())
++
++    try:
++        for name, cam in cameras.items():
++            cam.connect()
++            print(f"[OK] Connected: {name}")
++
++        for i in range(args.frames):
++            for name, cam in cameras.items():
++                frame = cam.read()
++                print(f"frame {i + 1:03d} | {name}: {summarize_frame(frame)}")
++            time.sleep(max(args.interval, 0.0))
++        return 0
++    except Exception as exc:
++        print(f"[FAIL] Camera test failed: {exc}")
++        return 1
++    finally:
++        for name, cam in cameras.items():
++            try:
++                cam.disconnect()
++                print(f"[OK] Disconnected: {name}")
++            except Exception as exc:
++                print(f"[WARN] Failed to disconnect {name}: {exc}")
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/cameras/test_zed.py b/tests/cameras/test_zed.py
+new file mode 100644
+index 00000000..a86efe74
+--- /dev/null
++++ b/tests/cameras/test_zed.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python
++
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import numpy as np
++import pytest
++
++from lerobot.cameras.configs import ColorMode
++
++pytest.importorskip("pyzed")
++
++from lerobot.cameras.zed import ZEDCamera, ZEDCameraConfig
++
++
++def test_postprocess_image_converts_bgra_to_rgb():
++    camera = ZEDCamera(ZEDCameraConfig(serial_number="123", color_mode=ColorMode.RGB))
++    bgra = np.array([[[255, 255, 0, 17]]], dtype=np.uint8)
++
++    rgb = camera._postprocess_image(bgra)
++
++    assert rgb.shape == (1, 1, 3)
++    np.testing.assert_array_equal(rgb[0, 0], np.array([0, 255, 255], dtype=np.uint8))
++
++
++def test_postprocess_image_converts_bgra_to_bgr():
++    camera = ZEDCamera(ZEDCameraConfig(serial_number="123", color_mode=ColorMode.BGR))
++    bgra = np.array([[[255, 255, 0, 17]]], dtype=np.uint8)
++
++    bgr = camera._postprocess_image(bgra)
++
++    assert bgr.shape == (1, 1, 3)
++    np.testing.assert_array_equal(bgr[0, 0], np.array([255, 255, 0], dtype=np.uint8))
+diff --git a/tests/datasets/test_franka_data.py b/tests/datasets/test_franka_data.py
+new file mode 100644
+index 00000000..7e413a75
+--- /dev/null
++++ b/tests/datasets/test_franka_data.py
+@@ -0,0 +1,648 @@
++#!/usr/bin/env python
++
++# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Manual Franka data-path tests.
++
++This module replaces the old ``lerobot.scripts.franka_rdk.debug`` script.
++It lives under ``tests/`` so Franka-specific checks stay with the repo-local
++integration surface instead of occupying a product CLI namespace.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import shlex
++import time
++from collections.abc import Sequence
++
++import draccus
++import pytest
++
++from lerobot.utils.import_utils import register_third_party_plugins
++
++
++RUN_FRANKA_TESTS = os.environ.get("LEROBOT_RUN_FRANKA_TESTS") == "1"
++ALLOW_FRANKA_MOTION = os.environ.get("LEROBOT_FRANKA_ALLOW_MOTION") == "1"
++
++pytestmark = pytest.mark.skipif(
++    not RUN_FRANKA_TESTS,
++    reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka hardware and ROS tests.",
++)
++
++
++def _build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(prog="test_franka_data")
++    subparsers = parser.add_subparsers(dest="command", required=True)
++
++    action_parser = subparsers.add_parser("action-listener", help="Listen to GELLO actions.")
++    action_parser.add_argument("--count", type=int, default=20)
++    action_parser.add_argument("--interval", type=float, default=0.1)
++
++    obs_parser = subparsers.add_parser("obs-listener", help="Listen to robot observations.")
++    obs_parser.add_argument("--count", type=int, default=20)
++    obs_parser.add_argument("--interval", type=float, default=0.1)
++
++    fake_action_parser = subparsers.add_parser("fake-action", help="Publish fake GELLO actions.")
++    fake_action_parser.add_argument("--rate-hz", type=float, default=30.0)
++    fake_action_parser.add_argument("--duration-s", type=float, default=2.0)
++    fake_action_parser.add_argument(
++        "--namespace", "--topic_namespace", "--topic-namespace", dest="namespace", default=""
++    )
++
++    fake_state_parser = subparsers.add_parser("fake-state", help="Publish fake robot observations.")
++    fake_state_parser.add_argument("--rate-hz", type=float, default=30.0)
++    fake_state_parser.add_argument("--duration-s", type=float, default=2.0)
++    fake_state_parser.add_argument(
++        "--namespace", "--topic_namespace", "--topic-namespace", dest="namespace", default=""
++    )
++
++    camera_parser = subparsers.add_parser("camera-test", help="Connect to configured cameras and read frames.")
++    camera_parser.add_argument("--frames", type=int, default=10)
++    camera_parser.add_argument("--interval", type=float, default=0.1)
++
++    gripper_parser = subparsers.add_parser("gripper-test", help="Run a short gripper open-close cycle.")
++    gripper_parser.add_argument("--cycles", type=int, default=2)
++    gripper_parser.add_argument("--settle-time-s", type=float, default=1.0)
++
++    pose_parser = subparsers.add_parser("read-ee-pose", help="Read the current end-effector pose from TF.")
++    pose_parser.add_argument("--samples", type=int, default=10)
++    pose_parser.add_argument("--rate-hz", type=float, default=5.0)
++    pose_parser.add_argument("--base-frame", type=str, default="fr3_link0")
++    pose_parser.add_argument("--tip-frame", type=str, default="fr3_link8")
++
++    ik_parser = subparsers.add_parser("franka-ik", help="Solve a single Franka IK query.")
++    ik_parser.add_argument("--x", type=float, default=0.3069)
++    ik_parser.add_argument("--y", type=float, default=0.0)
++    ik_parser.add_argument("--z", type=float, default=0.5903)
++    ik_parser.add_argument("--qx", type=float, default=0.924)
++    ik_parser.add_argument("--qy", type=float, default=-0.383)
++    ik_parser.add_argument("--qz", type=float, default=0.0)
++    ik_parser.add_argument("--qw", type=float, default=0.0)
++
++    return parser
++
++
++def _env_int(name: str, default: int) -> int:
++    return int(os.environ.get(name, str(default)))
++
++
++def _env_float(name: str, default: float) -> float:
++    return float(os.environ.get(name, str(default)))
++
++
++def _env_args(name: str) -> list[str]:
++    raw = os.environ.get(name, "")
++    return shlex.split(raw) if raw else []
++
++
++def _normalize_namespace_args(extra: Sequence[str]) -> list[str]:
++    normalized: list[str] = []
++    i = 0
++    aliases = {"--namespace", "--topic-namespace"}
++    while i < len(extra):
++        arg = extra[i]
++        if arg in aliases and i + 1 < len(extra) and not extra[i + 1].startswith("-"):
++            normalized.append(f"--topic_namespace={extra[i + 1]}")
++            i += 2
++            continue
++        if arg.startswith("--namespace="):
++            normalized.append(f"--topic_namespace={arg.split('=', 1)[1]}")
++        elif arg.startswith("--topic-namespace="):
++            normalized.append(f"--topic_namespace={arg.split('=', 1)[1]}")
++        else:
++            normalized.append(arg)
++        i += 1
++    return normalized
++
++
++def _summarize_frame(frame) -> str:
++    shape = getattr(frame, "shape", None)
++    dtype = getattr(frame, "dtype", None)
++    if shape is not None and dtype is not None:
++        return f"shape={tuple(shape)}, dtype={dtype}"
++    return f"type={type(frame)}"
++
++
++def _spin_node_for_duration(rclpy, node, duration_s: float) -> None:
++    deadline = time.monotonic() + max(duration_s, 0.0)
++    while time.monotonic() < deadline:
++        timeout = min(0.1, max(deadline - time.monotonic(), 0.0))
++        rclpy.spin_once(node, timeout_sec=timeout)
++
++
++def _run_action_listener(config_args: Sequence[str], count: int, interval: float) -> int:
++    from lerobot.teleoperators import make_teleoperator_from_config
++    from lerobot.teleoperators.gello_leader.config_gello_ros_leader import GelloRosLeaderConfig
++
++    register_third_party_plugins()
++    cfg = draccus.parse(config_class=GelloRosLeaderConfig, args=_normalize_namespace_args(config_args))
++    teleop = make_teleoperator_from_config(cfg)
++    teleop.connect()
++    try:
++        for i in range(count):
++            action = teleop.get_action()
++            arm = [action.get(f"joint_positions_{j}", 0.0) for j in range(7)]
++            gripper = action.get("joint_positions_7", 0.0)
++            print(f"[{i:06d}] arm={[round(v, 4) for v in arm]} gripper={gripper:.4f}")
++            time.sleep(max(interval, 0.0))
++    except KeyboardInterrupt:
++        return 130
++    finally:
++        teleop.disconnect()
++    return 0
++
++
++def _run_obs_listener(config_args: Sequence[str], count: int, interval: float) -> int:
++    from lerobot.robots import make_robot_from_config
++    from lerobot.robots.franka_fr3_robotiq_gripper.config_franka_fr3_robotiq_gripper import (
++        FrankaFr3RobotiqGripperConfig,
++    )
++
++    register_third_party_plugins()
++    cfg = draccus.parse(config_class=FrankaFr3RobotiqGripperConfig, args=_normalize_namespace_args(config_args))
++    robot = make_robot_from_config(cfg)
++    robot.connect()
++    try:
++        for i in range(count):
++            obs = robot.get_observation()
++            arm = [obs.get(f"joint_positions_{j}", 0.0) for j in range(7)]
++            gripper = obs.get("joint_positions_7", 0.0)
++            print(f"[{i:06d}] arm={[round(v, 4) for v in arm]} gripper={gripper:.4f}")
++            time.sleep(max(interval, 0.0))
++    except KeyboardInterrupt:
++        return 130
++    finally:
++        robot.disconnect()
++    return 0
++
++
++def _run_camera_test(frames: int, interval: float) -> int:
++    from lerobot.cameras.utils import make_cameras_from_configs
++    from lerobot.robots.franka_fr3_robotiq_gripper.config_franka_fr3_robotiq_gripper import (
++        FrankaFr3RobotiqGripperConfig,
++    )
++
++    register_third_party_plugins()
++    config = FrankaFr3RobotiqGripperConfig()
++    cameras = make_cameras_from_configs(config.cameras)
++
++    print("=== Franka Camera Test ===")
++    print(f"Configured cameras: {list(cameras.keys())}")
++
++    try:
++        for name, cam in cameras.items():
++            cam.connect()
++            print(f"[OK] Connected: {name}")
++
++        for frame_idx in range(frames):
++            for name, cam in cameras.items():
++                frame = cam.read()
++                print(f"frame {frame_idx + 1:03d} | {name}: {_summarize_frame(frame)}")
++            time.sleep(max(interval, 0.0))
++
++        return 0
++    except Exception as exc:
++        print(f"[FAIL] Camera test failed: {exc}")
++        return 1
++    finally:
++        for name, cam in cameras.items():
++            try:
++                cam.disconnect()
++                print(f"[OK] Disconnected: {name}")
++            except Exception as exc:
++                print(f"[WARN] Failed to disconnect {name}: {exc}")
++
++
++def _run_gripper_cycle(cycles: int, settle_time_s: float) -> int:
++    from lerobot.robots import make_robot_from_config
++    from lerobot.robots.franka_fr3_robotiq_gripper.config_franka_fr3_robotiq_gripper import (
++        FrankaFr3RobotiqGripperConfig,
++    )
++
++    register_third_party_plugins()
++    config = FrankaFr3RobotiqGripperConfig(cameras={})
++    robot = make_robot_from_config(config)
++    robot.connect()
++
++    try:
++        for cycle_idx in range(cycles):
++            for label, target_value in (("OPEN", 0.0), ("CLOSE", 0.085)):
++                obs = robot.get_observation()
++                action = {f"joint_positions_{i}": obs.get(f"joint_positions_{i}", 0.0) for i in range(7)}
++                action["joint_positions_7"] = target_value
++                print(f"cycle={cycle_idx + 1:02d} command={label} target={target_value:.3f}")
++                robot.send_action(action)
++                time.sleep(max(settle_time_s, 0.0))
++                new_obs = robot.get_observation()
++                print(f"feedback joint_positions_7={new_obs['joint_positions_7']:.4f}")
++    finally:
++        robot.disconnect()
++
++    return 0
++
++
++def _run_read_ee_pose(rate_hz: float, base_frame: str, tip_frame: str, samples: int) -> int:
++    import rclpy
++    from rclpy.node import Node
++    from tf2_ros import TransformException
++    from tf2_ros.buffer import Buffer
++    from tf2_ros.transform_listener import TransformListener
++
++    rclpy.init()
++    node = Node("franka_pose_reader")
++    tf_buffer = Buffer()
++    tf_listener = TransformListener(tf_buffer, node)
++    successes = 0
++
++    try:
++        for _ in range(samples):
++            _spin_node_for_duration(rclpy, node, 1.0 / max(rate_hz, 1e-6))
++            try:
++                transform = tf_buffer.lookup_transform(base_frame, tip_frame, rclpy.time.Time())
++            except TransformException as exc:
++                print(f"[WARN] TF not ready: {exc}")
++                continue
++
++            x = transform.transform.translation.x
++            y = transform.transform.translation.y
++            z = transform.transform.translation.z
++            qx = transform.transform.rotation.x
++            qy = transform.transform.rotation.y
++            qz = transform.transform.rotation.z
++            qw = transform.transform.rotation.w
++            print(f"XYZ: [{x:.4f}, {y:.4f}, {z:.4f}]")
++            print(f"Quat: [{qx:.4f}, {qy:.4f}, {qz:.4f}, {qw:.4f}]")
++            successes += 1
++    finally:
++        del tf_listener
++        node.destroy_node()
++        rclpy.shutdown()
++
++    return 0 if successes > 0 else 1
++
++
++def _run_franka_ik(x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float) -> int:
++    import rclpy
++    from geometry_msgs.msg import PoseStamped
++    from moveit_msgs.srv import GetPositionIK
++    from rclpy.node import Node
++
++    class FrankaIKSolver(Node):
++        def __init__(self) -> None:
++            super().__init__("franka_ik_solver")
++            self.ik_client = self.create_client(GetPositionIK, "/compute_ik")
++            while not self.ik_client.wait_for_service(timeout_sec=1.0):
++                self.get_logger().info("waiting for /compute_ik...")
++
++        def solve_ik(self, target_xyz: list[float], target_quat: list[float]):
++            req = GetPositionIK.Request()
++            req.ik_request.group_name = "fr3_arm"
++            req.ik_request.ik_link_name = "fr3_link8"
++
++            pose = PoseStamped()
++            pose.header.frame_id = "fr3_link0"
++            pose.header.stamp = self.get_clock().now().to_msg()
++            pose.pose.position.x = target_xyz[0]
++            pose.pose.position.y = target_xyz[1]
++            pose.pose.position.z = target_xyz[2]
++            pose.pose.orientation.x = target_quat[0]
++            pose.pose.orientation.y = target_quat[1]
++            pose.pose.orientation.z = target_quat[2]
++            pose.pose.orientation.w = target_quat[3]
++            req.ik_request.pose_stamped = pose
++            req.ik_request.timeout.sec = 0
++            req.ik_request.timeout.nanosec = 50_000_000
++
++            future = self.ik_client.call_async(req)
++            rclpy.spin_until_future_complete(self, future)
++            response = future.result()
++            if response is None:
++                self.get_logger().error("IK service returned no response.")
++                return None
++            if response.error_code.val == response.error_code.SUCCESS:
++                for name, pos in zip(response.solution.joint_state.name, response.solution.joint_state.position):
++                    print(f"{name}: {pos:.4f} rad")
++                return response.solution.joint_state.position
++            self.get_logger().error("IK failed: %s", response.error_code.val)
++            return None
++
++    rclpy.init()
++    node = FrankaIKSolver()
++    try:
++        result = node.solve_ik([x, y, z], [qx, qy, qz, qw])
++    finally:
++        node.destroy_node()
++        rclpy.shutdown()
++
++    return 0 if result is not None else 1
++
++
++def _run_fake_action_publisher(rate_hz: float, namespace: str, duration_s: float) -> int:
++    import math
++
++    import rclpy
++    from rclpy.executors import ExternalShutdownException
++    from rclpy.node import Node
++    from sensor_msgs.msg import JointState
++    from std_msgs.msg import Float32
++
++    class FakeGelloPublisher(Node):
++        def __init__(self) -> None:
++            node_name = "fake_gello_publisher" if not namespace else f"{namespace.strip('/')}_fake_gello_publisher"
++            super().__init__(node_name)
++            self.publish_rate_hz = rate_hz
++            self.joint_names = [f"fr3_joint{i}" for i in range(1, 8)]
++            prefix = f"/{namespace.strip('/')}" if namespace else ""
++            self.arm_joint_publisher = self.create_publisher(JointState, f"{prefix}/gello/joint_states", 10)
++            self.gripper_joint_publisher = self.create_publisher(
++                Float32, f"{prefix}/gripper/gripper_client/target_gripper_width_percent", 10
++            )
++            self.gripper_raw_publisher = self.create_publisher(Float32, f"{prefix}/gello/gripper_position", 10)
++            self.timer = self.create_timer(1 / self.publish_rate_hz, self.publish_joint_jog)
++            self.start_time = time.time()
++            self.last_logged_tick = -1
++
++        def infer_joint_and_gripper_positions(self):
++            elapsed = time.time() - self.start_time
++            joints = [0.1 * math.sin(elapsed + i) for i in range(7)]
++            gripper = 0.085 * ((math.sin(elapsed * 1.5) + 1.0) / 2.0)
++            return joints, gripper
++
++        def publish_joint_jog(self) -> None:
++            gello_arm_joints, gripper_position = self.infer_joint_and_gripper_positions()
++            elapsed = time.time() - self.start_time
++
++            arm_joint_states = JointState()
++            arm_joint_states.header.stamp = self.get_clock().now().to_msg()
++            arm_joint_states.name = self.joint_names
++            arm_joint_states.header.frame_id = "fr3_link0"
++            arm_joint_states.position = [float(v) for v in gello_arm_joints]
++
++            gripper_position = float(min(0.085, max(0.0, gripper_position)))
++            gripper_joint_states = Float32()
++            gripper_joint_states.data = 1.0 - (gripper_position / 0.085)
++            gripper_raw_states = Float32()
++            gripper_raw_states.data = gripper_position
++
++            self.arm_joint_publisher.publish(arm_joint_states)
++            self.gripper_joint_publisher.publish(gripper_joint_states)
++            self.gripper_raw_publisher.publish(gripper_raw_states)
++
++            current_tick = int(elapsed * self.publish_rate_hz)
++            if current_tick % 30 == 0 and current_tick != self.last_logged_tick:
++                self.last_logged_tick = current_tick
++                self.get_logger().info(
++                    "Fake output -> Arm: %s, Gripper target raw: %.3f, open percent: %.3f",
++                    [round(j, 3) for j in gello_arm_joints],
++                    gripper_raw_states.data,
++                    gripper_joint_states.data,
++                )
++
++    rclpy.init()
++    try:
++        fake_publisher = FakeGelloPublisher()
++    except Exception as exc:
++        print(f"Failed to initialize fake publisher: {exc}")
++        rclpy.try_shutdown()
++        return 1
++
++    try:
++        _spin_node_for_duration(rclpy, fake_publisher, duration_s)
++    except (KeyboardInterrupt, ExternalShutdownException):
++        pass
++    finally:
++        fake_publisher.destroy_node()
++        rclpy.try_shutdown()
++    return 0
++
++
++def _run_fake_state_publisher(rate_hz: float, namespace: str, duration_s: float) -> int:
++    import math
++
++    import rclpy
++    from rclpy.executors import ExternalShutdownException
++    from rclpy.node import Node
++    from sensor_msgs.msg import JointState
++
++    class FakeRobotStatePublisher(Node):
++        def __init__(self) -> None:
++            node_name = (
++                "fake_robot_state_publisher"
++                if not namespace
++                else f"{namespace.strip('/')}_fake_robot_state_publisher"
++            )
++            super().__init__(node_name)
++            self.publish_rate_hz = rate_hz
++            self.arm_joint_names = [f"fr3_joint{i}" for i in range(1, 8)]
++            prefix = f"/{namespace.strip('/')}" if namespace else ""
++            self.arm_state_publisher = self.create_publisher(JointState, f"{prefix}/franka/joint_states", 10)
++            self.gripper_state_publisher = self.create_publisher(JointState, f"{prefix}/gripper/joint_states", 10)
++            self.timer = self.create_timer(1 / self.publish_rate_hz, self.publish_state)
++            self.start_time = time.time()
++            self.last_logged_tick = -1
++
++        def publish_state(self) -> None:
++            elapsed = time.time() - self.start_time
++            arm_joints = [0.2 * math.cos(elapsed + i) for i in range(7)]
++            gripper_pos = 0.085 * ((math.sin(elapsed * 2.0) + 1.0) / 2.0)
++
++            arm_state_msg = JointState()
++            arm_state_msg.header.stamp = self.get_clock().now().to_msg()
++            arm_state_msg.name = self.arm_joint_names
++            arm_state_msg.position = [float(v) for v in arm_joints]
++
++            gripper_state_msg = JointState()
++            gripper_state_msg.header.stamp = self.get_clock().now().to_msg()
++            gripper_state_msg.name = ["robotiq_85_left_knuckle_joint"]
++            gripper_state_msg.position = [float(gripper_pos)]
++
++            self.arm_state_publisher.publish(arm_state_msg)
++            self.gripper_state_publisher.publish(gripper_state_msg)
++
++            current_tick = int(elapsed * self.publish_rate_hz)
++            if current_tick % 30 == 0 and current_tick != self.last_logged_tick:
++                self.last_logged_tick = current_tick
++                self.get_logger().info(
++                    "Fake State -> Arm: %s, Gripper: %.3f",
++                    [round(j, 3) for j in arm_joints],
++                    gripper_pos,
++                )
++
++    rclpy.init()
++    try:
++        fake_state_publisher = FakeRobotStatePublisher()
++    except Exception as exc:
++        print(f"Failed to initialize fake state publisher: {exc}")
++        rclpy.try_shutdown()
++        return 1
++
++    try:
++        _spin_node_for_duration(rclpy, fake_state_publisher, duration_s)
++    except (KeyboardInterrupt, ExternalShutdownException):
++        pass
++    finally:
++        fake_state_publisher.destroy_node()
++        rclpy.try_shutdown()
++    return 0
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++def test_franka_action_listener():
++    pytest.importorskip("rclpy")
++    assert (
++        _run_action_listener(
++            _env_args("LEROBOT_FRANKA_ACTION_ARGS"),
++            count=_env_int("LEROBOT_FRANKA_SAMPLE_COUNT", 5),
++            interval=_env_float("LEROBOT_FRANKA_INTERVAL_S", 0.1),
++        )
++        == 0
++    )
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++def test_franka_obs_listener():
++    pytest.importorskip("rclpy")
++    assert (
++        _run_obs_listener(
++            _env_args("LEROBOT_FRANKA_OBS_ARGS"),
++            count=_env_int("LEROBOT_FRANKA_SAMPLE_COUNT", 5),
++            interval=_env_float("LEROBOT_FRANKA_INTERVAL_S", 0.1),
++        )
++        == 0
++    )
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++def test_franka_fake_action_publisher():
++    pytest.importorskip("rclpy")
++    pytest.importorskip("sensor_msgs")
++    pytest.importorskip("std_msgs")
++    assert (
++        _run_fake_action_publisher(
++            rate_hz=_env_float("LEROBOT_FRANKA_RATE_HZ", 30.0),
++            namespace=os.environ.get("LEROBOT_FRANKA_NAMESPACE", ""),
++            duration_s=_env_float("LEROBOT_FRANKA_DURATION_S", 1.0),
++        )
++        == 0
++    )
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++def test_franka_fake_state_publisher():
++    pytest.importorskip("rclpy")
++    pytest.importorskip("sensor_msgs")
++    assert (
++        _run_fake_state_publisher(
++            rate_hz=_env_float("LEROBOT_FRANKA_RATE_HZ", 30.0),
++            namespace=os.environ.get("LEROBOT_FRANKA_NAMESPACE", ""),
++            duration_s=_env_float("LEROBOT_FRANKA_DURATION_S", 1.0),
++        )
++        == 0
++    )
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++def test_franka_camera_streams():
++    assert (
++        _run_camera_test(
++            frames=_env_int("LEROBOT_FRANKA_CAMERA_FRAMES", 3),
++            interval=_env_float("LEROBOT_FRANKA_INTERVAL_S", 0.1),
++        )
++        == 0
++    )
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++@pytest.mark.skipif(
++    not ALLOW_FRANKA_MOTION,
++    reason="Set LEROBOT_FRANKA_ALLOW_MOTION=1 to run the gripper motion test.",
++)
++def test_franka_gripper_cycle():
++    pytest.importorskip("rclpy")
++    assert (
++        _run_gripper_cycle(
++            cycles=_env_int("LEROBOT_FRANKA_GRIPPER_CYCLES", 1),
++            settle_time_s=_env_float("LEROBOT_FRANKA_SETTLE_TIME_S", 1.0),
++        )
++        == 0
++    )
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++def test_franka_read_ee_pose():
++    pytest.importorskip("rclpy")
++    pytest.importorskip("tf2_ros")
++    assert (
++        _run_read_ee_pose(
++            rate_hz=_env_float("LEROBOT_FRANKA_RATE_HZ", 5.0),
++            base_frame=os.environ.get("LEROBOT_FRANKA_BASE_FRAME", "fr3_link0"),
++            tip_frame=os.environ.get("LEROBOT_FRANKA_TIP_FRAME", "fr3_link8"),
++            samples=_env_int("LEROBOT_FRANKA_POSE_SAMPLES", 3),
++        )
++        == 0
++    )
++
++
++@pytest.mark.skipif(not RUN_FRANKA_TESTS, reason="Set LEROBOT_RUN_FRANKA_TESTS=1 to run Franka tests.")
++def test_franka_ik():
++    pytest.importorskip("rclpy")
++    pytest.importorskip("moveit_msgs")
++    pytest.importorskip("geometry_msgs")
++    assert (
++        _run_franka_ik(
++            x=_env_float("LEROBOT_FRANKA_IK_X", 0.3069),
++            y=_env_float("LEROBOT_FRANKA_IK_Y", 0.0),
++            z=_env_float("LEROBOT_FRANKA_IK_Z", 0.5903),
++            qx=_env_float("LEROBOT_FRANKA_IK_QX", 0.924),
++            qy=_env_float("LEROBOT_FRANKA_IK_QY", -0.383),
++            qz=_env_float("LEROBOT_FRANKA_IK_QZ", 0.0),
++            qw=_env_float("LEROBOT_FRANKA_IK_QW", 0.0),
++        )
++        == 0
++    )
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    register_third_party_plugins()
++    arg_parser = _build_parser()
++    args, extra = arg_parser.parse_known_args(argv)
++
++    if args.command not in {"action-listener", "obs-listener"} and extra:
++        arg_parser.error(f"unrecognized arguments: {' '.join(extra)}")
++
++    if args.command == "action-listener":
++        return _run_action_listener(extra, args.count, args.interval)
++    if args.command == "obs-listener":
++        return _run_obs_listener(extra, args.count, args.interval)
++    if args.command == "fake-action":
++        return _run_fake_action_publisher(args.rate_hz, args.namespace, args.duration_s)
++    if args.command == "fake-state":
++        return _run_fake_state_publisher(args.rate_hz, args.namespace, args.duration_s)
++    if args.command == "camera-test":
++        return _run_camera_test(args.frames, args.interval)
++    if args.command == "gripper-test":
++        return _run_gripper_cycle(args.cycles, args.settle_time_s)
++    if args.command == "read-ee-pose":
++        return _run_read_ee_pose(args.rate_hz, args.base_frame, args.tip_frame, args.samples)
++    if args.command == "franka-ik":
++        return _run_franka_ik(args.x, args.y, args.z, args.qx, args.qy, args.qz, args.qw)
++
++    raise AssertionError(f"Unhandled command: {args.command}")
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/robots/test_gripper.py b/tests/robots/test_gripper.py
+new file mode 100644
+index 00000000..a7373e5f
+--- /dev/null
++++ b/tests/robots/test_gripper.py
+@@ -0,0 +1,39 @@
++import time
++
++from lerobot.configs import parser
++from lerobot.robots import make_robot_from_config
++from lerobot.robots.franka_fr3_robotiq_gripper.config_franka_fr3_robotiq_gripper import (
++    FrankaFr3RobotiqGripperConfig,
++)
++from lerobot.utils.import_utils import register_third_party_plugins
++
++
++@parser.wrap()
++def run(cfg: FrankaFr3RobotiqGripperConfig):
++    if not cfg.cameras:
++        cfg.cameras = {}
++    robot = make_robot_from_config(cfg)
++    robot.connect()
++    try:
++        obs = robot.get_observation()
++        for step in [0.0, 0.085, 0.0, 0.085]:
++            action = {f"joint_positions_{i}": obs.get(f"joint_positions_{i}", 0.0) for i in range(7)}
++            action["joint_positions_7"] = step
++            print(f"Sending gripper target: {step}")
++            robot.send_action(action)
++            for _ in range(20):
++                time.sleep(0.1)
++                current = robot.get_observation().get("joint_positions_7", 0.0)
++                print(f"Current gripper feedback: {current:.4f}", end="\r")
++            print()
++    finally:
++        robot.disconnect()
++
++
++def main():
++    register_third_party_plugins()
++    run()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/robots/test_robot_action_publisher.py b/tests/robots/test_robot_action_publisher.py
+new file mode 100644
+index 00000000..a0a9ae18
+--- /dev/null
++++ b/tests/robots/test_robot_action_publisher.py
+@@ -0,0 +1,77 @@
++import math
++import time
++from typing import List
++
++import rclpy
++from rclpy.executors import ExternalShutdownException
++from rclpy.node import Node
++from sensor_msgs.msg import JointState
++from std_msgs.msg import Float32
++
++
++class FakeGelloPublisher(Node):
++    def __init__(self, namespace: str) -> None:
++        super().__init__("fake_gello_publisher")
++        self.namespace = namespace.strip("/")
++        prefix = f"/{self.namespace}" if self.namespace else ""
++        self.publish_rate = 30
++        self.joint_names: List[str] = [f"fr3_joint{i}" for i in range(1, 8)]
++
++        self.arm_joint_publisher = self.create_publisher(JointState, f"{prefix}/gello/joint_states", 10)
++        self.gripper_joint_publisher = self.create_publisher(
++            Float32,
++            f"{prefix}/gripper/gripper_client/target_gripper_width_percent",
++            10,
++        )
++        self.gripper_raw_publisher = self.create_publisher(Float32, f"{prefix}/gello/gripper_position", 10)
++
++        self.timer = self.create_timer(1 / self.publish_rate, self.publish_joint_jog)
++        self.start_time = time.time()
++
++    def publish_joint_jog(self) -> None:
++        t = time.time() - self.start_time
++        joints = [0.1 * math.sin(t + i) for i in range(7)]
++        gripper = 0.085 * ((math.sin(t * 1.5) + 1.0) / 2.0)
++
++        arm_joint_states = JointState()
++        arm_joint_states.header.stamp = self.get_clock().now().to_msg()
++        arm_joint_states.name = self.joint_names
++        arm_joint_states.header.frame_id = "fr3_link0"
++        arm_joint_states.position = [float(v) for v in joints]
++
++        gripper = float(min(0.085, max(0.0, gripper)))
++        gripper_joint_states = Float32()
++        gripper_joint_states.data = 1.0 - (gripper / 0.085)
++        gripper_raw_states = Float32()
++        gripper_raw_states.data = gripper
++
++        self.arm_joint_publisher.publish(arm_joint_states)
++        self.gripper_joint_publisher.publish(gripper_joint_states)
++        self.gripper_raw_publisher.publish(gripper_raw_states)
++
++
++def main():
++    import argparse
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--namespace", default="left")
++    args = parser.parse_args()
++
++    rclpy.init()
++    try:
++        fake_publisher = FakeGelloPublisher(args.namespace)
++    except Exception:
++        rclpy.try_shutdown()
++        raise
++
++    try:
++        rclpy.spin(fake_publisher)
++    except (KeyboardInterrupt, ExternalShutdownException):
++        pass
++    finally:
++        fake_publisher.destroy_node()
++        rclpy.try_shutdown()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/robots/test_robot_state_publisher.py b/tests/robots/test_robot_state_publisher.py
+new file mode 100644
+index 00000000..5d51ace2
+--- /dev/null
++++ b/tests/robots/test_robot_state_publisher.py
+@@ -0,0 +1,67 @@
++import math
++import time
++from typing import List
++
++import rclpy
++from rclpy.executors import ExternalShutdownException
++from rclpy.node import Node
++from sensor_msgs.msg import JointState
++
++
++class FakeRobotStatePublisher(Node):
++    def __init__(self, namespace: str) -> None:
++        super().__init__("fake_robot_state_publisher")
++        self.namespace = namespace.strip("/")
++        prefix = f"/{self.namespace}" if self.namespace else ""
++        self.publish_rate = 30
++        self.arm_joint_names: List[str] = [f"{self.namespace}_fr3_joint{i}" if self.namespace else f"fr3_joint{i}" for i in range(1, 8)]
++
++        self.arm_state_publisher = self.create_publisher(JointState, f"{prefix}/franka/joint_states", 10)
++        self.gripper_state_publisher = self.create_publisher(JointState, f"{prefix}/gripper/joint_states", 10)
++        self.start_time = time.time()
++        self.timer = self.create_timer(1 / self.publish_rate, self.publish_state)
++
++    def publish_state(self) -> None:
++        t = time.time() - self.start_time
++        arm_joints = [0.2 * math.cos(t + i) for i in range(7)]
++        gripper_pos = 0.085 * ((math.sin(t * 2.0) + 1.0) / 2.0)
++
++        arm_state_msg = JointState()
++        arm_state_msg.header.stamp = self.get_clock().now().to_msg()
++        arm_state_msg.name = self.arm_joint_names
++        arm_state_msg.position = [float(v) for v in arm_joints]
++
++        gripper_state_msg = JointState()
++        gripper_state_msg.header.stamp = self.get_clock().now().to_msg()
++        gripper_state_msg.name = ["robotiq_85_left_knuckle_joint"]
++        gripper_state_msg.position = [float(gripper_pos)]
++
++        self.arm_state_publisher.publish(arm_state_msg)
++        self.gripper_state_publisher.publish(gripper_state_msg)
++
++
++def main():
++    import argparse
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--namespace", default="left")
++    args = parser.parse_args()
++
++    rclpy.init()
++    try:
++        node = FakeRobotStatePublisher(args.namespace)
++    except Exception:
++        rclpy.try_shutdown()
++        raise
++
++    try:
++        rclpy.spin(node)
++    except (KeyboardInterrupt, ExternalShutdownException):
++        pass
++    finally:
++        node.destroy_node()
++        rclpy.try_shutdown()
++
++
++if __name__ == "__main__":
++    main()
