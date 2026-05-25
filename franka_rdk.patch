@@ -1,8 +1,16 @@
 diff --git a/pyproject.toml b/pyproject.toml
-index c299199c..1cdf243e 100644
+index c299199c..f29cb6c0 100644
 --- a/pyproject.toml
 +++ b/pyproject.toml
-@@ -133,6 +133,7 @@ intelrealsense = [
+@@ -79,6 +79,7 @@ dependencies = [
+     "opencv-python-headless>=4.9.0,<4.14.0",
+     "av>=15.0.0,<16.0.0",
+     "jsonlines>=4.0.0,<5.0.0",
++    "msgpack>=1.1.0,<2.0.0",
+     "pynput>=1.7.8,<1.9.0",
+     "pyserial>=3.5,<4.0",
+ 
+@@ -133,6 +134,7 @@ intelrealsense = [
      "pyrealsense2>=2.55.1.6486,<2.57.0 ; sys_platform != 'darwin'",
      "pyrealsense2-macosx>=2.54,<2.57.0 ; sys_platform == 'darwin'",
  ]
@@ -10,6 +18,14 @@ index c299199c..1cdf243e 100644
  phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
  
  # Policies
+@@ -228,6 +230,7 @@ lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
+ lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
+ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
+ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
++lerobot-franka-record="lerobot.scripts.lerobot_record:main"
+ 
+ # ---------------- Tool Configurations ----------------
+ [tool.setuptools.package-data]
 diff --git a/src/lerobot/async_inference/robot_client.py b/src/lerobot/async_inference/robot_client.py
 index 0ee70a0e..26f55be2 100644
 --- a/src/lerobot/async_inference/robot_client.py
@@ -196,3 +212,20 @@ index f050d572..33aca917 100644
  from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
  from lerobot.configs import parser
  from lerobot.processor import (
+diff --git a/src/lerobot/utils/import_utils.py b/src/lerobot/utils/import_utils.py
+index 2b26b230..e835e113 100644
+--- a/src/lerobot/utils/import_utils.py
++++ b/src/lerobot/utils/import_utils.py
+@@ -171,4 +171,12 @@ def register_third_party_plugins() -> None:
+         if dist_name.startswith(prefixes):
+             attempt_import(dist_name)
+ 
++    try:
++        from lerobot.franka_rdk.register import register as register_franka_rdk_plugins
++
++        register_franka_rdk_plugins()
++        imported.append("lerobot.franka_rdk")
++    except Exception:
++        logging.debug("Franka RDK local plugin package is not available or failed to import.", exc_info=True)
++
+     logging.debug("Third-party plugin import summary: imported=%s failed=%s", imported, failed)

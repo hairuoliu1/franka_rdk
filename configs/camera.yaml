@@ -1,0 +1,26 @@
+left_arm:
+  left_camera:
+    type: opencv
+    index_or_path: /dev/video0
+    width: 640
+    height: 480
+    fps: 30
+    warmup_s: 3
+    fourcc: MJPG
+
+right_arm:
+  middle_zed:
+    type: zed2
+    serial_number: 10758215
+    width: 672
+    height: 376
+    fps: 30
+    warmup_s: 3
+  right_camera:
+    type: opencv
+    index_or_path: /dev/video2
+    width: 640
+    height: 480
+    fps: 30
+    warmup_s: 3
+    fourcc: MJPG
