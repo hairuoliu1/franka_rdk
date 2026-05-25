@@ -1973,7 +1973,7 @@ index 0248a276..19b963c5 100644
      parser.add_argument(
          "--output-dir",
 diff --git a/src/lerobot/scripts/lerobot_record.py b/src/lerobot/scripts/lerobot_record.py
-index c58f8f10..84bb1b24 100644
+index c58f8f10..21cb699e 100644
 --- a/src/lerobot/scripts/lerobot_record.py
 +++ b/src/lerobot/scripts/lerobot_record.py
 @@ -82,6 +82,7 @@ from lerobot.cameras import (  # noqa: F401
@@ -1984,6 +1984,62 @@ index c58f8f10..84bb1b24 100644
  from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
  from lerobot.configs import parser
  from lerobot.configs.policies import PreTrainedConfig
+@@ -141,6 +142,7 @@ from lerobot.utils.control_utils import (
+     predict_action,
+     sanity_check_dataset_name,
+     sanity_check_dataset_robot_compatibility,
++    wait_for_continue_signal,
+ )
+ from lerobot.utils.device_utils import get_safe_torch_device
+ from lerobot.utils.import_utils import register_third_party_plugins
+@@ -607,25 +609,33 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+                     display_compressed_images=display_compressed_images,
+                 )
+ 
+-                # Execute a few seconds without recording to give time to manually reset the environment
+-                # Skip reset for the last episode to be recorded
++                # Execute a reset phase between episodes. When reset_time_s <= 0, keep resetting
++                # until the operator presses the down arrow to continue.
+                 if not events["stop_recording"] and (
+                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                 ):
+                     log_say("Reset the environment", cfg.play_sounds)
+ 
+-                    record_loop(
+-                        robot=robot,
+-                        events=events,
+-                        fps=cfg.dataset.fps,
+-                        teleop_action_processor=teleop_action_processor,
+-                        robot_action_processor=robot_action_processor,
+-                        robot_observation_processor=robot_observation_processor,
+-                        teleop=teleop,
+-                        control_time_s=cfg.dataset.reset_time_s,
+-                        single_task=cfg.dataset.single_task,
+-                        display_data=cfg.display_data,
+-                    )
++                    if cfg.dataset.reset_time_s > 0:
++                        record_loop(
++                            robot=robot,
++                            events=events,
++                            fps=cfg.dataset.fps,
++                            teleop_action_processor=teleop_action_processor,
++                            robot_action_processor=robot_action_processor,
++                            robot_observation_processor=robot_observation_processor,
++                            teleop=teleop,
++                            control_time_s=cfg.dataset.reset_time_s,
++                            single_task=cfg.dataset.single_task,
++                            display_data=cfg.display_data,
++                        )
++                    else:
++                        logging.info(
++                            "Reset phase is waiting for the down arrow key to continue to the next episode."
++                        )
++                        events["exit_early"] = False
++                        wait_for_continue_signal(events)
++                        events["exit_early"] = False
+ 
+                 if events["rerecord_episode"]:
+                     log_say("Re-record episode", cfg.play_sounds)
 diff --git a/src/lerobot/scripts/lerobot_teleoperate.py b/src/lerobot/scripts/lerobot_teleoperate.py
 index f050d572..33aca917 100644
 --- a/src/lerobot/scripts/lerobot_teleoperate.py
@@ -2357,6 +2413,80 @@ index 00000000..1c6b6ac2
 +            self._node = None
 +
 +        self._connected = False
+diff --git a/src/lerobot/utils/control_utils.py b/src/lerobot/utils/control_utils.py
+index 94cd82fa..1d813c80 100644
+--- a/src/lerobot/utils/control_utils.py
++++ b/src/lerobot/utils/control_utils.py
+@@ -18,6 +18,7 @@
+ 
+ 
+ import logging
++import time
+ import traceback
+ from contextlib import nullcontext
+ from copy import copy
+@@ -120,9 +121,12 @@ def init_keyboard_listener():
+     """
+     Initializes a non-blocking keyboard listener for real-time user interaction.
+ 
+-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
+-    the program flow during execution, such as stopping recording or exiting loops. It gracefully
+-    handles headless environments where keyboard listening is not possible.
++    This function sets up a listener for specific keys:
++    - right arrow: end the current recording loop early
++    - left arrow: rerecord the current episode
++    - down arrow: continue after a manual reset prompt
++    - escape: stop the full recording session
++    It gracefully handles headless environments where keyboard listening is not possible.
+ 
+     Returns:
+         A tuple containing:
+@@ -136,6 +140,7 @@ def init_keyboard_listener():
+     events["exit_early"] = False
+     events["rerecord_episode"] = False
+     events["stop_recording"] = False
++    events["awaiting_continue"] = False
+ 
+     if is_headless():
+         logging.warning(
+@@ -149,10 +154,13 @@ def init_keyboard_listener():
+ 
+     def on_press(key):
+         try:
+-            if key == keyboard.Key.right:
++            if key == keyboard.Key.down and events["awaiting_continue"]:
++                print("Down arrow key pressed. Continuing to the next step...")
++                events["exit_early"] = True
++            elif key == keyboard.Key.right and not events["awaiting_continue"]:
+                 print("Right arrow key pressed. Exiting loop...")
+                 events["exit_early"] = True
+-            elif key == keyboard.Key.left:
++            elif key == keyboard.Key.left and not events["awaiting_continue"]:
+                 print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                 events["rerecord_episode"] = True
+                 events["exit_early"] = True
+@@ -169,6 +177,21 @@ def init_keyboard_listener():
+     return listener, events
+ 
+ 
++def wait_for_continue_signal(events: dict[str, bool], poll_interval_s: float = 0.05) -> None:
++    """
++    Waits for the reset loop to be acknowledged with the down arrow key.
++
++    The keyboard listener sets `events["exit_early"]` when the down arrow is pressed
++    while `events["awaiting_continue"]` is enabled.
++    """
++    events["awaiting_continue"] = True
++    try:
++        while not events["exit_early"] and not events["stop_recording"]:
++            time.sleep(poll_interval_s)
++    finally:
++        events["awaiting_continue"] = False
++
++
+ def sanity_check_dataset_name(repo_id, policy_cfg):
+     """
+     Validates the dataset repository name against the presence of a policy configuration.
 diff --git a/src/lerobot/utils/import_utils.py b/src/lerobot/utils/import_utils.py
 index 2b26b230..e835e113 100644
 --- a/src/lerobot/utils/import_utils.py
