@@ -589,15 +589,17 @@ python -m lerobot.scripts.lerobot_record \
 ```bash
 # ===== 终端 1: GELLO 状态发布 =====
 ros2 launch franka_gello_state_publisher main.launch.py \
-    config_file:=configs/gello_publisher.yaml
+    config_file:=/workspace/configs/gello_publisher.yaml
 
 # ===== 终端 2: 关节阻抗控制器 =====
 ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
     robot_config_file:=/workspace/configs/fr3_config.yaml
 
 # ===== 终端 3: Robotiq 夹爪 =====
+ros2 run franka_fr3_arm_controllers set_collision_behavior.py left right
+
 ros2 launch franka_gripper_manager robotiq_gripper_controller_client.launch.py \
-    config_file:=configs/robotiq_gripper_config.yaml
+    config_file:=/workspace/configs/robotiq_gripper_config.yaml
 
 # ===== 终端 4: 力传感器 (可选) =====
 ros2 launch robotiq_ft_sensor_hardware ft_sensor_standalone.launch.py

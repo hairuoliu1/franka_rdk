@@ -14,10 +14,20 @@ def load_yaml(file_path):
         return yaml.safe_load(file)
 
 
+def resolve_config_file(config_file_name, package_config_dir):
+    if os.path.isabs(config_file_name):
+        return config_file_name
+
+    if os.path.exists(config_file_name):
+        return os.path.abspath(config_file_name)
+
+    return os.path.join(package_config_dir, "config", config_file_name)
+
+
 def generate_robot_nodes(context):
     config_file_name = LaunchConfiguration("config_file").perform(context)
     package_config_dir = FindPackageShare("franka_gello_state_publisher").perform(context)
-    config_file = os.path.join(package_config_dir, "config", config_file_name)
+    config_file = resolve_config_file(config_file_name, package_config_dir)
     configs = load_yaml(config_file)
     nodes = []
     for item_name, config in configs.items():
